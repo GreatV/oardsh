@@ -6,15 +6,21 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run prepare-runtime && npm run build",
     "frontendDist": "../dist"
   },
   "app": {
     "windows": [
       {
-        "title": "oardsh",
-        "width": 800,
-        "height": 600
+        "label": "main",
+        "title": "DeepSeek Harness",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 960,
+        "minHeight": 640,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true
       }
     ],
     "security": {
@@ -24,12 +30,22 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "category": "DeveloperTool",
+    "shortDescription": "Native desktop shell for DeepSeek Harness",
+    "longDescription": "oardsh launches dsh web as a native desktop app: it starts the local DeepSeek Harness server and loads the UI in a desktop window.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "resources": [
+      "resources/runtime",
+      "resources/dsh"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    }
   }
 }
