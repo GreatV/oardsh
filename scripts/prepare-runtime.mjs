@@ -6,11 +6,15 @@ import { execFileSync } from "node:child_process";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const runtimeDir = join(root, "src-tauri/resources/runtime");
 const dshDir = join(root, "src-tauri/resources/dsh");
-const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
-const spec = pkg.dependencies["@deepseek-ai/dsh"];
+const pluginSource = join(root, "packages/oardsh-dsh-plugin");
+const pluginDest = join(dshDir, "plugins/oardsh-dsh-plugin");
+// This directory installs with no committed lockfile, so a range would resolve
+// to whatever is newest on the release runner. Take what the root lock pins.
+const lock = JSON.parse(readFileSync(join(root, "package-lock.json"), "utf8"));
+const spec = lock.packages?.["node_modules/@deepseek-ai/dsh"]?.version;
 
 if (!spec) {
-  throw new Error("package.json is missing dependency @deepseek-ai/dsh");
+  throw new Error("package-lock.json does not pin @deepseek-ai/dsh; run npm install");
 }
 
 mkdirSync(runtimeDir, { recursive: true });
@@ -23,6 +27,11 @@ if (process.platform !== "win32") {
 
 rmSync(dshDir, { recursive: true, force: true });
 mkdirSync(dshDir, { recursive: true });
+execFileSync(process.execPath, [join(pluginSource, "scripts/build.mjs")], {
+  cwd: root,
+  stdio: "inherit",
+});
+cpSync(pluginSource, pluginDest, { recursive: true });
 writeFileSync(
   join(dshDir, "package.json"),
   `${JSON.stringify(
@@ -31,6 +40,7 @@ writeFileSync(
       private: true,
       dependencies: {
         "@deepseek-ai/dsh": spec,
+        "@oardsh/dsh-plugin": "file:plugins/oardsh-dsh-plugin",
       },
     },
     null,
@@ -38,7 +48,10 @@ writeFileSync(
   )}\n`,
 );
 
-execFileSync("npm", ["install", "--omit=dev"], {
+// Windows resolves npm through npm.cmd, and execFileSync does no PATHEXT
+// lookup, so the bare name throws ENOENT on the release runner.
+const npm = process.platform === "win32" ? "npm.cmd" : "npm";
+execFileSync(npm, ["install", "--omit=dev"], {
   cwd: dshDir,
   stdio: "inherit",
   env: process.env,

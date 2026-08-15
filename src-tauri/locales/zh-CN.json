@@ -1,0 +1,10 @@
+{
+  "notification.completed.title": "dsh 已完成当前回合",
+  "notification.approval.title": "dsh 等待批准",
+  "notification.approval.body": "Agent 需要你的批准",
+  "notification.question.title": "dsh 等待回答",
+  "notification.question.body": "Agent 提出了一个问题，请打开工作区窗口继续。",
+  "notification.webCompleted.body": "Agent 已完成当前回合",
+  "notification.updated.title": "dsh 状态变化",
+  "notification.updated.body": "Agent 状态已更新"
+}

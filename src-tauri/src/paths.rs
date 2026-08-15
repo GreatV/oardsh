@@ -1,63 +1,12 @@
 use std::env;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
 
 use tauri::{AppHandle, Manager};
 
 const DSH_ENTRY: &str = "node_modules/@deepseek-ai/dsh/lib/bin.js";
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Tool {
-    pub path: String,
-    pub version: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Environment {
-    pub node: Option<Tool>,
-    pub npx: Option<Tool>,
-    pub dsh: Option<Tool>,
-    pub home: Option<String>,
-    pub dsh_home: Option<String>,
-    pub path: String,
-    pub launcher: String,
-}
-
-pub fn probe(app: &AppHandle) -> Environment {
-    let path = path_with_package_bins(app);
-    env::set_var("PATH", &path);
-    let node = resolve_node(app)
-        .ok()
-        .map(|path| tool_from_command(&path, &[], &["-v"]));
-    let npx = find_tool("npx", &["--version"]);
-    let dsh = bundled_dsh(app).map(|dsh| match resolve_node(app) {
-        Ok(node) => tool_from_command(&node, &[dsh.as_os_str()], &["-V"]),
-        Err(_) => tool_from_command(&dsh, &[], &["-V"]),
-    });
-    let home = home_dir().map(|p| p.display().to_string());
-    let dsh_home = resolve_dsh_home();
-    let launcher = if bundled_dsh(app).is_some() {
-        "bundled".to_string()
-    } else if dsh.is_some() {
-        "dsh".to_string()
-    } else {
-        "missing".to_string()
-    };
-    Environment {
-        node,
-        npx,
-        dsh,
-        home,
-        dsh_home,
-        path: path.to_string_lossy().into_owned(),
-        launcher,
-    }
-}
+const PLUGIN_FILES: &[&str] = &["package.json", "lib/index.js", "lib/client.js"];
 
 pub fn home_dir() -> Option<PathBuf> {
     env::var_os("HOME")
@@ -188,27 +137,75 @@ pub fn path_with_package_bins(app: &AppHandle) -> OsString {
     env::join_paths(parts).unwrap_or_else(|_| augmented_path())
 }
 
-pub fn resolve_launch(
-    app: &AppHandle,
-    custom_dsh: Option<&str>,
-) -> Result<(PathBuf, Vec<String>, String), String> {
-    if let Some(custom) = custom_dsh.map(str::trim).filter(|s| !s.is_empty()) {
-        let path = PathBuf::from(custom);
-        if !path.exists() {
-            return Err(format!("Custom dsh path does not exist: {custom}"));
-        }
-        return Ok((path, vec!["web".into()], format!("{custom} web")));
-    }
+/// Resolve the dsh launcher, so callers never learn its package layout.
+pub fn resolve_dsh(app: &AppHandle) -> Result<PathBuf, String> {
+    bundled_dsh(app).ok_or_else(|| {
+        "Bundled @deepseek-ai/dsh is missing. Run `npm install` and try again.".into()
+    })
+}
 
-    if let Some(dsh) = bundled_dsh(app) {
-        let display = format!("{} web", dsh.display());
-        return Ok((dsh, vec!["web".into()], display));
+pub fn desktop_patch(app: &AppHandle) -> Result<PathBuf, String> {
+    let mut candidates =
+        vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/oardsh.patch.yml")];
+    if let Ok(resource) = app.path().resource_dir() {
+        candidates.push(resource.join("oardsh.patch.yml"));
+        candidates.push(resource.join("resources/oardsh.patch.yml"));
     }
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .and_then(|path| fs::canonicalize(path).ok())
+        .ok_or_else(|| "oardsh dsh plugin patch is missing".to_string())
+}
 
-    Err(
-        "Bundled @deepseek-ai/dsh is missing. Run `npm install` in the oardsh project so the package is available in node_modules."
-            .into(),
-    )
+/// Stage the oardsh package beside dsh's shared profile modules, where dsh
+/// resolves Loader entries from.
+pub fn ensure_desktop_plugin(app: &AppHandle) -> Result<(), String> {
+    let mut sources = vec![
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../packages/oardsh-dsh-plugin"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/dsh/plugins/oardsh-dsh-plugin"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources/dsh/node_modules/@oardsh/dsh-plugin"),
+    ];
+    if let Ok(resource) = app.path().resource_dir() {
+        // node_modules holds a symlink that may not survive the bundler, so
+        // prefer the real directory prepare-runtime copies to dsh/plugins.
+        sources.push(resource.join("dsh/plugins/oardsh-dsh-plugin"));
+        sources.push(resource.join("dsh/node_modules/@oardsh/dsh-plugin"));
+    }
+    let source = sources
+        .into_iter()
+        .find(|path| path.join("lib/client.js").is_file())
+        .ok_or_else(|| "oardsh dsh client plugin is missing".to_string())?;
+    let home = resolve_dsh_home()
+        .map(PathBuf::from)
+        .ok_or_else(|| "Unable to resolve DSH_HOME".to_string())?;
+    let target = home.join("profiles/node_modules/@oardsh/dsh-plugin");
+    // package.json carries `dsh.client.inject`, so comparing only the generated
+    // client would miss a change to which dsh modules the plugin needs.
+    let up_to_date = PLUGIN_FILES.iter().all(|name| {
+        matches!(
+            (fs::read(target.join(name)), fs::read(source.join(name))),
+            (Ok(staged), Ok(origin)) if staged == origin
+        )
+    });
+    if up_to_date {
+        return Ok(());
+    }
+    if target.exists() {
+        fs::remove_dir_all(&target).map_err(|err| {
+            format!(
+                "Failed to refresh managed desktop plugin {}: {err}",
+                target.display()
+            )
+        })?;
+    }
+    fs::create_dir_all(target.join("lib")).map_err(|err| err.to_string())?;
+    for name in PLUGIN_FILES {
+        fs::copy(source.join(name), target.join(name))
+            .map_err(|err| format!("Failed to stage desktop plugin file {name}: {err}"))?;
+    }
+    Ok(())
 }
 
 fn search_roots(app: &AppHandle) -> Vec<PathBuf> {
@@ -258,41 +255,6 @@ fn package_bin_dir(dsh_entry: &Path) -> Option<PathBuf> {
         .and_then(|scope| scope.parent())
         .map(|node_modules| node_modules.join(".bin"))
         .filter(|dir| dir.is_dir())
-}
-
-fn find_tool(name: &str, version_args: &[&str]) -> Option<Tool> {
-    let path = which(name, &augmented_path())?;
-    Some(tool_from_command(&path, &[], version_args))
-}
-
-fn tool_from_command(program: &Path, prefix: &[&OsStr], version_args: &[&str]) -> Tool {
-    let version = Command::new(program)
-        .args(prefix)
-        .args(version_args)
-        .env("PATH", augmented_path())
-        .output()
-        .ok()
-        .and_then(|output| {
-            let text = if output.stdout.is_empty() {
-                String::from_utf8_lossy(&output.stderr).into_owned()
-            } else {
-                String::from_utf8_lossy(&output.stdout).into_owned()
-            };
-            let line = text.lines().next().unwrap_or_default().trim();
-            if line.is_empty() {
-                None
-            } else {
-                Some(line.to_string())
-            }
-        });
-    let path = prefix
-        .last()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| program.to_path_buf());
-    Tool {
-        path: path.display().to_string(),
-        version,
-    }
 }
 
 fn which(name: &str, path_value: &OsString) -> Option<PathBuf> {
@@ -348,7 +310,7 @@ fn push_existing<const N: usize>(dirs: &mut Vec<PathBuf>, candidates: [PathBuf; 
 fn push_nvm_bins(home: &Path, dirs: &mut Vec<PathBuf>) {
     let versions = home.join(".nvm/versions/node");
     let mut found = collect_version_bins(&versions, "bin");
-    found.sort_by(|a, b| version_key(&b.0).cmp(&version_key(&a.0)));
+    found.sort_by_key(|item| std::cmp::Reverse(version_key(&item.0)));
     for (_, bin) in found {
         if !dirs.iter().any(|known| known == &bin) {
             dirs.push(bin);
@@ -359,7 +321,7 @@ fn push_nvm_bins(home: &Path, dirs: &mut Vec<PathBuf>) {
 fn push_fnm_bins(home: &Path, dirs: &mut Vec<PathBuf>) {
     let versions = home.join(".fnm/node-versions");
     let mut found = collect_version_bins(&versions, "installation/bin");
-    found.sort_by(|a, b| version_key(&b.0).cmp(&version_key(&a.0)));
+    found.sort_by_key(|item| std::cmp::Reverse(version_key(&item.0)));
     for (_, bin) in found {
         if !dirs.iter().any(|known| known == &bin) {
             dirs.push(bin);
@@ -390,9 +352,4 @@ fn version_key(name: &str) -> (u64, u64, u64) {
     let minor = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let patch = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     (major, minor, patch)
-}
-
-#[allow(dead_code)]
-pub fn short_timeout() -> Duration {
-    Duration::from_secs(2)
 }

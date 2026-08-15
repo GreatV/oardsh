@@ -1,0 +1,10 @@
+{
+  "notification.completed.title": "dsh finished the current turn",
+  "notification.approval.title": "dsh is waiting for approval",
+  "notification.approval.body": "The agent needs your approval",
+  "notification.question.title": "dsh is waiting for an answer",
+  "notification.question.body": "The agent asked a question. Open the workspace window to continue.",
+  "notification.webCompleted.body": "The agent completed the current turn",
+  "notification.updated.title": "dsh status changed",
+  "notification.updated.body": "Agent status updated"
+}

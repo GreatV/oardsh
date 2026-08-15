@@ -1,0 +1,3 @@
+- insert:
+    - id: oardsh-desktop
+      name: '@oardsh/dsh-plugin'

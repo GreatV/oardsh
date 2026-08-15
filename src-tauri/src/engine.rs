@@ -4,17 +4,27 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, Url, WebviewWindow};
+use tauri_plugin_notification::NotificationExt;
 
+use crate::i18n;
 use crate::paths;
-use crate::settings::{self, Settings};
 
 const LOG_LIMIT: usize = 400;
+const START_TIMEOUT: Duration = Duration::from_secs(120);
+/// The dsh page can call `native_web_event`, so its body is untrusted length.
+const NOTIFICATION_BODY_LIMIT: usize = 180;
+const HOST: &str = "127.0.0.1";
+
+/// The main window's original URL, captured at setup so stopping can navigate
+/// back. It differs per platform and build, so it must not be hardcoded.
+static BOOT_URL: OnceLock<Url> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,36 +48,30 @@ pub struct LogLine {
 pub struct Status {
     pub phase: Phase,
     pub url: Option<String>,
-    pub workspace: Option<String>,
-    pub port: u16,
-    pub host: String,
-    pub command: Option<String>,
     pub error: Option<String>,
-    pub attached: bool,
     pub logs: Vec<LogLine>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// `Status` minus the logs: `app.emit` reaches every webview, and once dsh is
+/// serving, the main window is a remote dsh page. The boot screen reads logs
+/// from `dsh_status`, which only the local origin may call.
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct StartOptions {
-    pub workspace: String,
-    pub port: u16,
-    pub host: Option<String>,
-    pub dsh_path: Option<String>,
-    pub auto_launch: Option<bool>,
+pub struct StatusEvent {
+    phase: Phase,
+    url: Option<String>,
+    error: Option<String>,
 }
 
 struct Inner {
     phase: Phase,
     url: Option<String>,
-    workspace: Option<String>,
-    port: u16,
-    host: String,
-    command: Option<String>,
     error: Option<String>,
-    attached: bool,
     child: Option<Child>,
     logs: VecDeque<LogLine>,
+    /// Bumped on every start and stop. A launch thread carries the generation
+    /// it was spawned for and stands down once it no longer matches.
+    generation: u64,
 }
 
 impl Inner {
@@ -75,17 +79,14 @@ impl Inner {
         Status {
             phase: self.phase,
             url: self.url.clone(),
-            workspace: self.workspace.clone(),
-            port: self.port,
-            host: self.host.clone(),
-            command: self.command.clone(),
             error: self.error.clone(),
-            attached: self.attached,
             logs: self.logs.iter().cloned().collect(),
         }
     }
 }
 
+/// Supervises the single bundled dsh web server. dsh owns the workspace concept
+/// in its own page, so the shell never reasons about project directories.
 pub struct Engine {
     inner: Mutex<Inner>,
 }
@@ -96,14 +97,10 @@ impl Engine {
             inner: Mutex::new(Inner {
                 phase: Phase::Idle,
                 url: None,
-                workspace: None,
-                port: 3080,
-                host: "127.0.0.1".into(),
-                command: None,
                 error: None,
-                attached: false,
                 child: None,
                 logs: VecDeque::new(),
+                generation: 0,
             }),
         }
     }
@@ -116,209 +113,139 @@ impl Engine {
         self.lock().snapshot()
     }
 
-    pub fn stop(&self, app: &AppHandle) {
-        let child = {
-            let mut inner = self.lock();
-            inner.phase = Phase::Stopping;
-            inner.attached = false;
-            emit_status(app, &inner.snapshot());
-            inner.child.take()
-        };
-        if let Some(mut child) = child {
-            kill_child(&mut child);
-            let _ = child.wait();
-        }
-        let mut inner = self.lock();
-        inner.phase = Phase::Idle;
-        inner.url = None;
-        inner.command = None;
-        emit_status(app, &inner.snapshot());
+    fn generation(&self) -> u64 {
+        self.lock().generation
     }
 
-    pub fn start(&self, app: &AppHandle, options: StartOptions) -> Result<Status, String> {
-        let workspace = PathBuf::from(options.workspace.trim());
-        if !workspace.is_dir() {
-            return Err(format!(
-                "Workspace is not a directory: {}",
-                workspace.display()
-            ));
-        }
-        if options.port == 0 {
-            return Err("Port must be between 1 and 65535".into());
-        }
-        let host = options
-            .host
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("127.0.0.1")
-            .to_string();
-        if host == "0.0.0.0" {
-            return Err("dsh web does not support --host 0.0.0.0 yet".into());
-        }
-
-        {
-            let inner = self.lock();
-            if inner.phase == Phase::Starting {
-                return Err("dsh is already starting".into());
-            }
-            if inner.phase == Phase::Ready
-                && inner.workspace.as_deref() == Some(&workspace.display().to_string())
-                && inner.port == options.port
-                && inner.host == host
-            {
-                if let Some(url) = inner.url.clone() {
-                    let _ = navigate_main(app, &url);
-                }
-                return Ok(inner.snapshot());
-            }
-        }
-
-        self.stop(app);
-
-        let (program, mut args, display_base) =
-            paths::resolve_launch(app, options.dsh_path.as_deref())?;
-        args.push("--host".into());
-        args.push(host.clone());
-        args.push("--port".into());
-        args.push(options.port.to_string());
-
-        let url = format!("http://{host}:{}", options.port);
-        let display = format!("{display_base} --host {host} --port {}", options.port);
-
-        persist_start_settings(app, &workspace, options.port, &host, &options);
-
-        {
+    pub fn start(&self, app: &AppHandle) {
+        let generation = {
             let mut inner = self.lock();
+            if matches!(inner.phase, Phase::Starting | Phase::Ready) {
+                return;
+            }
+            inner.generation += 1;
             inner.phase = Phase::Starting;
+            inner.url = None;
             inner.error = None;
-            inner.attached = false;
-            inner.workspace = Some(workspace.display().to_string());
-            inner.port = options.port;
-            inner.host = host.clone();
-            inner.command = Some(display.clone());
-            inner.url = Some(url.clone());
             inner.logs.clear();
-            emit_status(app, &inner.snapshot());
-        }
+            inner.generation
+        };
+        emit_status(app, self);
 
-        self.push_log(app, "stdout", format!("Launching {display}"));
-        self.push_log(
-            app,
-            "stdout",
-            format!("Workspace {}", workspace.display()),
+        let handle = app.clone();
+        thread::spawn(move || {
+            let engine = handle.state::<Engine>();
+            if let Err(message) = engine.start_process(&handle, generation) {
+                engine.fail(&handle, generation, &message);
+            }
+        });
+    }
+
+    fn start_process(&self, app: &AppHandle, generation: u64) -> Result<(), String> {
+        paths::ensure_desktop_plugin(app)?;
+        let program = paths::resolve_dsh(app)?;
+        let patch = paths::desktop_patch(app)?;
+        let host = HOST.to_string();
+        let args = vec![
+            "web".to_string(),
+            "--patch".to_string(),
+            patch.display().to_string(),
+            "--host".to_string(),
+            host.clone(),
+            "--port".to_string(),
+            "0".to_string(),
+        ];
+        let display = format!(
+            "{} web --patch {} --host {host} --port 0",
+            program.display(),
+            patch.display()
         );
+        self.push_log("stdout", format!("Launching {display}"));
 
-        if http_ready(&host, options.port) {
-            self.push_log(
-                app,
-                "stdout",
-                format!("Attached to an existing server at {url}"),
-            );
-            let status = self.mark_ready(app, true);
-            let _ = navigate_main(app, &url);
-            return Ok(status);
-        }
+        // dsh resolves working directories from its own registry; the server
+        // just needs somewhere stable to run.
+        let cwd = paths::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let mut command = dsh_command(app, &program, &args)?;
+        configure_command(app, &mut command, &cwd);
+        let mut child = command
+            .spawn()
+            .map_err(|err| format!("Failed to start dsh: {err}"))?;
+        self.push_log("stdout", format!("pid {}", child.id()));
 
-        let mut command = build_command(app, &program, &args)?;
-        command
-            .current_dir(&workspace)
-            .env("PATH", paths::path_with_package_bins(app))
-            .env("HOME", paths::home_dir().unwrap_or_else(|| workspace.clone()))
-            .env("CI", "1")
-            .env("NPM_CONFIG_YES", "true")
-            .env("npm_config_yes", "true")
-            .env("NPM_CONFIG_UPDATE_NOTIFIER", "false")
-            .env("npm_config_update_notifier", "false")
-            .env("NPM_CONFIG_PROGRESS", "false")
-            .env("npm_config_fund", "false")
-            .env("npm_config_audit", "false")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        apply_process_isolation(&mut command);
-
-        let mut child = command.spawn().map_err(|err| {
-            let message = format!("Failed to start dsh: {err}");
-            self.fail(app, &message);
-            message
-        })?;
-
-        self.push_log(app, "stdout", format!("pid {}", child.id()));
-
+        let (url_tx, url_rx) = mpsc::channel();
         if let Some(stdout) = child.stdout.take() {
-            spawn_reader(app.clone(), "stdout", stdout);
+            spawn_reader(app.clone(), "stdout", stdout, Some(url_tx));
         }
         if let Some(stderr) = child.stderr.take() {
-            spawn_reader(app.clone(), "stderr", stderr);
+            spawn_reader(app.clone(), "stderr", stderr, None);
         }
-
         {
             let mut inner = self.lock();
+            if inner.generation != generation {
+                kill_child(&mut child);
+                return Ok(());
+            }
             inner.child = Some(child);
         }
 
         let started = Instant::now();
-        let mut last_heartbeat = Instant::now();
-        loop {
-            if http_ready(&host, options.port) {
-                let status = self.mark_ready(app, false);
-                let _ = navigate_main(app, &url);
-                return Ok(status);
+        let mut discovered: Option<(String, u16)> = None;
+        while started.elapsed() < START_TIMEOUT {
+            if self.generation() != generation {
+                return Ok(());
             }
-
+            if let Ok(url) = url_rx.try_recv() {
+                if let Ok(parsed) = Url::parse(&url) {
+                    if let Some(port) = parsed.port_or_known_default() {
+                        discovered = Some((url, port));
+                    }
+                }
+            }
+            if let Some((url, port)) = discovered.as_ref() {
+                if http_ready(&host, *port) {
+                    return self.mark_ready(app, generation, url.clone());
+                }
+            }
             if let Some(code) = self.try_reap() {
-                let logs = self.recent_log_text();
-                let message = format!(
-                    "dsh exited before the UI was ready (code {code}).\n{logs}"
-                );
-                self.fail(app, &message);
-                return Err(message);
+                return Err(format!(
+                    "dsh exited before the UI was ready (code {code}).\n{}",
+                    self.recent_log_text()
+                ));
             }
-
-            if last_heartbeat.elapsed() >= Duration::from_secs(5) {
-                self.push_log(
-                    app,
-                    "stdout",
-                    format!(
-                        "Waiting for {url} ({}s). First boot initializes the local dsh web profile.",
-                        started.elapsed().as_secs()
-                    ),
-                );
-                last_heartbeat = Instant::now();
-            }
-
-            thread::sleep(Duration::from_millis(150));
+            thread::sleep(Duration::from_millis(100));
         }
+        Err("Timed out waiting for dsh to announce its dynamic port".into())
     }
 
-    fn mark_ready(&self, app: &AppHandle, attached: bool) -> Status {
-        let mut inner = self.lock();
-        inner.phase = Phase::Ready;
-        inner.attached = attached;
-        inner.error = None;
-        let status = inner.snapshot();
-        emit_status(app, &status);
-        status
+    fn mark_ready(&self, app: &AppHandle, generation: u64, url: String) -> Result<(), String> {
+        {
+            let mut inner = self.lock();
+            if inner.generation != generation {
+                return Ok(());
+            }
+            inner.phase = Phase::Ready;
+            inner.url = Some(url.clone());
+            inner.error = None;
+        }
+        emit_status(app, self);
+        show_dsh(app, &url)
     }
 
-    fn fail(&self, app: &AppHandle, message: &str) {
+    fn fail(&self, app: &AppHandle, generation: u64, message: &str) {
         let child = {
             let mut inner = self.lock();
+            if inner.generation != generation {
+                return;
+            }
             inner.phase = Phase::Error;
             inner.error = Some(message.to_string());
-            inner.attached = false;
-            emit_status(app, &inner.snapshot());
             inner.child.take()
         };
         if let Some(mut child) = child {
             kill_child(&mut child);
             let _ = child.wait();
         }
-        if !is_boot_url(app) {
-            let _ = show_boot(app);
-        }
+        emit_status(app, self);
     }
 
     fn try_reap(&self) -> Option<i32> {
@@ -334,7 +261,8 @@ impl Engine {
     }
 
     fn recent_log_text(&self) -> String {
-        self.lock()
+        let inner = self.lock();
+        inner
             .logs
             .iter()
             .rev()
@@ -347,7 +275,9 @@ impl Engine {
             .join("\n")
     }
 
-    pub fn push_log(&self, app: &AppHandle, stream: &str, line: String) {
+    /// Buffer a line for the failure report. Never broadcast: dsh's stdout can
+    /// carry workspace paths and prompt fragments. See `StatusEvent`.
+    pub fn push_log(&self, stream: &str, line: String) {
         if line.trim().is_empty() {
             return;
         }
@@ -355,166 +285,208 @@ impl Engine {
             stream: stream.to_string(),
             line,
         };
-        let _ = app.emit("dsh-log", &entry);
         let mut inner = self.lock();
         inner.logs.push_back(entry);
         while inner.logs.len() > LOG_LIMIT {
             inner.logs.pop_front();
         }
     }
+
+    /// Stop the server. `release_window` returns the window to the boot screen;
+    /// a window that is already closing must not be navigated.
+    pub fn stop(&self, app: &AppHandle, release_window: bool) {
+        let (generation, child) = {
+            let mut inner = self.lock();
+            if inner.phase == Phase::Idle && inner.child.is_none() {
+                return;
+            }
+            inner.generation += 1;
+            inner.phase = Phase::Stopping;
+            inner.url = None;
+            (inner.generation, inner.child.take())
+        };
+        emit_status(app, self);
+        if let Some(mut child) = child {
+            kill_child(&mut child);
+            let _ = child.wait();
+        }
+        {
+            // A start() that raced in while the child was dying owns the phase
+            // now; writing Idle would strand it as never started.
+            let mut inner = self.lock();
+            if inner.generation != generation {
+                return;
+            }
+            inner.phase = Phase::Idle;
+        }
+        if release_window {
+            if let (Some(window), Some(url)) = (app.get_webview_window("main"), BOOT_URL.get()) {
+                let _ = window.navigate(url.clone());
+            }
+        }
+        emit_status(app, self);
+    }
+}
+
+/// Capture the main window's real URL before anything navigates it away.
+pub fn remember_boot_url(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        if let Ok(url) = window.url() {
+            let _ = BOOT_URL.set(url);
+        }
+    }
 }
 
 #[tauri::command]
-pub fn probe_environment(app: AppHandle) -> paths::Environment {
-    paths::probe(&app)
-}
-
-#[tauri::command]
-pub fn get_status(engine: State<Engine>) -> Status {
+pub fn dsh_status(engine: State<Engine>) -> Status {
     engine.status()
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeWebEvent {
+    kind: String,
+    body: String,
+    language: String,
+}
+
 #[tauri::command]
-pub fn retry_dsh(app: AppHandle) {
-    boot_dsh(&app);
-}
-
-pub fn show_boot(app: &AppHandle) -> Result<(), String> {
-    navigate_main(app, &boot_url())
-}
-
-pub fn pick_workspace(app: &AppHandle) -> Option<PathBuf> {
-    use tauri_plugin_dialog::DialogExt;
-    app.dialog()
-        .file()
-        .set_title("Choose a DeepSeek Harness workspace")
-        .blocking_pick_folder()
-        .and_then(|path| path.into_path().ok())
-}
-
-pub fn launch_from_menu(app: &AppHandle, workspace: PathBuf) {
-    let mut stored = settings::load(app);
-    settings::remember_workspace(&mut stored, &workspace.display().to_string());
-    let _ = settings::save(app, &stored);
-    let _ = app.emit("settings-changed", &stored);
-    let _ = show_boot(app);
-    let options = StartOptions {
-        workspace: workspace.display().to_string(),
-        port: stored.port,
-        host: Some(stored.host),
-        dsh_path: stored.dsh_path,
-        auto_launch: Some(true),
+pub fn native_web_event(app: AppHandle, event: NativeWebEvent) {
+    let title_key = match event.kind.as_str() {
+        "approval" => "notification.approval.title",
+        "question" => "notification.question.title",
+        "completed" => "notification.completed.title",
+        _ => "notification.updated.title",
     };
-    let handle = app.clone();
-    thread::spawn(move || {
-        let engine = handle.state::<Engine>();
-        let _ = engine.start(&handle, options);
-    });
+    let body_key = match event.kind.as_str() {
+        "approval" => "notification.approval.body",
+        "question" => "notification.question.body",
+        "completed" => "notification.webCompleted.body",
+        _ => "notification.updated.body",
+    };
+    let title = i18n::translate(&event.language, title_key);
+    let body = if event.body.trim().is_empty() {
+        i18n::translate(&event.language, body_key)
+    } else {
+        truncate(event.body.trim(), NOTIFICATION_BODY_LIMIT)
+    };
+    let _ = app
+        .notification()
+        .builder()
+        .title(&title)
+        .body(&body)
+        .show();
+}
+
+/// Cut on a character count, never a byte offset, so multi-byte input cannot panic.
+fn truncate(value: &str, limit: usize) -> String {
+    match value.char_indices().nth(limit) {
+        Some((end, _)) => format!("{}…", &value[..end]),
+        None => value.to_string(),
+    }
 }
 
 pub fn restart_from_menu(app: &AppHandle) {
-    let _ = show_boot(app);
-    boot_dsh(app);
+    let engine = app.state::<Engine>();
+    engine.stop(app, true);
+    engine.start(app);
 }
 
 pub fn boot_dsh(app: &AppHandle) {
-    let stored = settings::load(app);
-    let workspace = resolve_workspace(&stored);
-    let handle = app.clone();
-    thread::spawn(move || {
-        let engine = handle.state::<Engine>();
-        let _ = engine.start(
-            &handle,
-            StartOptions {
-                workspace,
-                port: stored.port,
-                host: Some(stored.host),
-                dsh_path: stored.dsh_path,
-                auto_launch: Some(true),
-            },
-        );
-    });
+    app.state::<Engine>().start(app);
 }
 
-fn resolve_workspace(stored: &Settings) -> String {
-    if let Some(workspace) = stored.workspace.as_deref() {
-        if Path::new(workspace).is_dir() {
-            return workspace.to_string();
-        }
-    }
-    paths::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .display()
-        .to_string()
+fn emit_status(app: &AppHandle, engine: &Engine) {
+    let status = engine.status();
+    let _ = app.emit(
+        "dsh-status",
+        StatusEvent {
+            phase: status.phase,
+            url: status.url,
+            error: status.error,
+        },
+    );
 }
 
-fn persist_start_settings(
-    app: &AppHandle,
-    workspace: &Path,
-    port: u16,
-    host: &str,
-    options: &StartOptions,
-) {
-    let mut stored = settings::load(app);
-    settings::remember_workspace(&mut stored, &workspace.display().to_string());
-    stored.port = port;
-    stored.host = host.to_string();
-    if options.dsh_path.is_some() {
-        stored.dsh_path = options.dsh_path.clone();
-    }
-    if let Some(auto_launch) = options.auto_launch {
-        stored.auto_launch = auto_launch;
-    }
-    let _ = settings::save(app, &stored);
-    let _ = app.emit("settings-changed", &stored);
-}
-
-fn emit_status(app: &AppHandle, status: &Status) {
-    let _ = app.emit("dsh-status", status);
-}
-
-pub fn navigate_main(app: &AppHandle, url: &str) -> Result<(), String> {
+/// Point the main window at the running server and bring it forward.
+fn show_dsh(app: &AppHandle, url: &str) -> Result<(), String> {
+    let parsed = Url::parse(url).map_err(|err| err.to_string())?;
     let window = app
         .get_webview_window("main")
-        .ok_or_else(|| "main window is missing".to_string())?;
-    let parsed = Url::parse(url).map_err(|err| err.to_string())?;
+        .ok_or_else(|| "Main window is missing".to_string())?;
     window.navigate(parsed).map_err(|err| err.to_string())?;
-    let _ = window.set_title("DeepSeek Harness");
-    Ok(())
+    let _ = window.unminimize();
+    window.show().map_err(|err| err.to_string())?;
+    window.set_focus().map_err(|err| err.to_string())
 }
 
-pub fn boot_url() -> String {
-    if cfg!(dev) {
-        "http://localhost:1420/".into()
-    } else if cfg!(target_os = "windows") {
-        "http://tauri.localhost/".into()
-    } else {
-        "tauri://localhost/".into()
+pub fn reload_main(app: &AppHandle) {
+    if let Some(window) = current_window(app) {
+        let _ = window.eval("location.reload()");
     }
 }
 
-fn is_boot_url(app: &AppHandle) -> bool {
-    let Some(window) = app.get_webview_window("main") else {
-        return false;
-    };
-    let Ok(url) = window.url() else {
-        return false;
-    };
-    let value = url.as_str();
-    value.contains(":1420") || value.starts_with("tauri://") || value.contains("tauri.localhost")
+pub fn current_window(app: &AppHandle) -> Option<WebviewWindow> {
+    app.get_webview_window("main")
 }
 
-fn spawn_reader<R: Read + Send + 'static>(app: AppHandle, stream: &'static str, reader: R) {
+fn spawn_reader<R: Read + Send + 'static>(
+    app: AppHandle,
+    stream: &'static str,
+    reader: R,
+    url_tx: Option<Sender<String>>,
+) {
     thread::spawn(move || {
         let engine = app.state::<Engine>();
         let buf = BufReader::new(reader);
         for line in buf.lines() {
             match line {
-                Ok(text) => engine.push_log(&app, stream, text),
+                Ok(text) => {
+                    if let Some(url) = announced_url(&text) {
+                        if let Some(tx) = url_tx.as_ref() {
+                            let _ = tx.send(url);
+                        }
+                    }
+                    engine.push_log(stream, text);
+                }
                 Err(_) => break,
             }
         }
     });
+}
+
+/// Recover the dynamic port dsh bound to. The banner wording is not a contract,
+/// so any loopback URL is accepted as a fallback rather than stalling the
+/// launch for START_TIMEOUT on a reworded line.
+fn announced_url(line: &str) -> Option<String> {
+    const MARKER: &str = "dsh web: ";
+    if let Some(start) = line.find(MARKER) {
+        if let Some(url) = loopback_url(line[start + MARKER.len()..].trim_start()) {
+            return Some(url);
+        }
+    }
+    let start = line.find("http://")?;
+    loopback_url(&line[start..])
+}
+
+fn loopback_url(value: &str) -> Option<String> {
+    if !value.starts_with("http://") {
+        return None;
+    }
+    let end = value
+        .find(|character: char| {
+            character.is_whitespace() || matches!(character, '"' | '\'' | '<' | '>' | ')' | ',')
+        })
+        .unwrap_or(value.len());
+    let candidate = value[..end].trim_end_matches(['.', ';', ':']);
+    let parsed = Url::parse(candidate).ok()?;
+    // An explicit port keeps a docs link from being mistaken for the server;
+    // a loopback host keeps us probing only this machine.
+    parsed.port()?;
+    match parsed.host_str()? {
+        "127.0.0.1" | "localhost" | "0.0.0.0" | "[::1]" | "::1" => Some(candidate.to_string()),
+        _ => None,
+    }
 }
 
 fn http_ready(host: &str, port: u16) -> bool {
@@ -538,20 +510,14 @@ fn http_ready(host: &str, port: u16) -> bool {
     matches!(stream.read(&mut buf), Ok(n) if n >= 5 && buf.starts_with(b"HTTP/"))
 }
 
-fn build_command(app: &AppHandle, program: &Path, args: &[String]) -> Result<Command, String> {
-    #[cfg(windows)]
-    {
-        let ext = program
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if ext == "cmd" || ext == "bat" {
-            let mut command = Command::new("cmd");
-            command.arg("/C").arg(program).args(args);
-            return Ok(command);
-        }
-    }
+pub(crate) fn dsh_command(
+    app: &AppHandle,
+    program: &Path,
+    args: &[String],
+) -> Result<Command, String> {
+    // No explicit `cmd /C` for batch files: Command runs .cmd/.bat itself with
+    // the CVE-2024-24576 escaping, and routing args through our own cmd would
+    // opt back out of it.
     if is_node_script(program) {
         let node = paths::resolve_node(app)?;
         let mut command = Command::new(node);
@@ -563,12 +529,32 @@ fn build_command(app: &AppHandle, program: &Path, args: &[String]) -> Result<Com
     Ok(command)
 }
 
+pub(crate) fn configure_command(app: &AppHandle, command: &mut Command, workspace: &Path) {
+    command
+        .current_dir(workspace)
+        .env("PATH", paths::path_with_package_bins(app))
+        .env(
+            "HOME",
+            paths::home_dir().unwrap_or_else(|| workspace.to_path_buf()),
+        )
+        .env("CI", "1")
+        .env("NPM_CONFIG_YES", "true")
+        .env("NPM_CONFIG_UPDATE_NOTIFIER", "false")
+        .env("NPM_CONFIG_PROGRESS", "false")
+        .env("npm_config_fund", "false")
+        .env("npm_config_audit", "false")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    apply_process_isolation(command);
+}
+
 fn is_node_script(program: &Path) -> bool {
-    let is_js = program
+    if program
         .extension()
         .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("js"));
-    if is_js {
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("js"))
+    {
         return true;
     }
     let Ok(mut file) = File::open(program) else {
@@ -597,7 +583,7 @@ fn apply_process_isolation(command: &mut Command) {
     }
 }
 
-fn kill_child(child: &mut Child) {
+pub(crate) fn kill_child(child: &mut Child) {
     #[cfg(unix)]
     {
         let pid = child.id() as i32;
@@ -611,6 +597,7 @@ fn kill_child(child: &mut Child) {
     }
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
         let _ = Command::new("taskkill")
             .args(["/PID", &child.id().to_string(), "/T", "/F"])
             .creation_flags(0x0800_0000)
@@ -619,13 +606,44 @@ fn kill_child(child: &mut Child) {
     let _ = child.kill();
 }
 
-pub fn reload_main(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.reload();
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::{announced_url, truncate};
 
-#[allow(dead_code)]
-pub fn current_window(app: &AppHandle) -> Option<WebviewWindow> {
-    app.get_webview_window("main")
+    #[test]
+    fn truncates_on_character_boundaries() {
+        assert_eq!(truncate("short", 8), "short");
+        assert_eq!(truncate("abcdefghij", 4), "abcd…");
+        // Byte slicing here would panic: each character is three bytes.
+        assert_eq!(truncate("需要你的批准", 3), "需要你…");
+    }
+
+    #[test]
+    fn parses_dynamic_port_announcement() {
+        assert_eq!(
+            announced_url("dsh web: http://127.0.0.1:54732"),
+            Some("http://127.0.0.1:54732".into())
+        );
+        assert_eq!(announced_url("unrelated output"), None);
+    }
+
+    #[test]
+    fn falls_back_to_any_loopback_url_when_the_banner_changes() {
+        assert_eq!(
+            announced_url("  ➜  Local:  http://localhost:41234/  "),
+            Some("http://localhost:41234/".into())
+        );
+        assert_eq!(
+            announced_url("listening on http://127.0.0.1:8080."),
+            Some("http://127.0.0.1:8080".into())
+        );
+    }
+
+    #[test]
+    fn ignores_urls_that_cannot_be_the_local_server() {
+        // No explicit port: a docs link, not a dynamically bound server.
+        assert_eq!(announced_url("see http://localhost/guide"), None);
+        // Not loopback.
+        assert_eq!(announced_url("dsh web: http://example.com:8080"), None);
+    }
 }

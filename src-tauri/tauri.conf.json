@@ -24,7 +24,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: data: http://asset.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; frame-src 'none'"
     }
   },
   "bundle": {
@@ -42,7 +42,8 @@
     ],
     "resources": [
       "resources/runtime",
-      "resources/dsh"
+      "resources/dsh",
+      "resources/oardsh.patch.yml"
     ],
     "macOS": {
       "minimumSystemVersion": "10.15"

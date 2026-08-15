@@ -1,0 +1,6 @@
+{
+  "boot.starting": "Starting dsh Web…",
+  "boot.failed": "dsh Web could not start",
+  "boot.description": "oardsh will open dsh Web directly in this window.",
+  "boot.details": "Startup details"
+}

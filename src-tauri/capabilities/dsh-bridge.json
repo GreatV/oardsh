@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "dsh-bridge",
+  "description": "Commands the desktop panel may call from a dsh workspace page. Reachable by anything the local dsh server serves, so treat every argument as untrusted. Deliberately no core:default: these commands do not need it, and its event permission would expose the dsh-status broadcast.",
+  "windows": ["main", "dsh-*"],
+  "remote": {
+    "urls": ["http://127.0.0.1:*"]
+  },
+  "permissions": [
+    "allow-native-web-event",
+    "allow-token-usage"
+  ]
+}

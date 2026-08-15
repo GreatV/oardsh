@@ -1,0 +1,6 @@
+{
+  "boot.starting": "正在启动 dsh Web…",
+  "boot.failed": "dsh Web 启动失败",
+  "boot.description": "oardsh 会在当前窗口直接打开 dsh Web。",
+  "boot.details": "启动详情"
+}
