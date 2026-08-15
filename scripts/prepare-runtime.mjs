@@ -48,13 +48,18 @@ writeFileSync(
   )}\n`,
 );
 
-// Windows resolves npm through npm.cmd, and execFileSync does no PATHEXT
-// lookup, so the bare name throws ENOENT on the release runner.
-const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-execFileSync(npm, ["install", "--omit=dev"], {
+// On Windows the bare name misses the PATHEXT lookup, and since CVE-2024-27980
+// Node refuses to execFile npm.cmd at all. npm points npm_execpath at its own
+// JS entry, which runs on every platform without a shell.
+const npmEntry = process.env.npm_execpath?.endsWith(".js")
+  ? process.env.npm_execpath
+  : null;
+const args = ["install", "--omit=dev"];
+execFileSync(npmEntry ? process.execPath : "npm", npmEntry ? [npmEntry, ...args] : args, {
   cwd: dshDir,
   stdio: "inherit",
   env: process.env,
+  shell: !npmEntry && process.platform === "win32",
 });
 
 console.log(`Prepared runtime node at ${nodeDest}`);
