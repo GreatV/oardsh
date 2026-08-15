@@ -21,7 +21,7 @@ jobs:
             target: aarch64-apple-darwin
             args: --target aarch64-apple-darwin
           - name: macOS Intel
-            platform: macos-15-intel
+            platform: macos-26-intel
             target: x86_64-apple-darwin
             args: --target x86_64-apple-darwin
           - name: Linux x64
@@ -37,11 +37,13 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
 
+      # libfuse2: linuxdeploy, which bundles the AppImage, is itself an
+      # AppImage, and the ubuntu-22.04 image no longer ships FUSE to mount one.
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils libfuse2
 
       - name: Set up Node.js
         uses: actions/setup-node@v7
@@ -76,6 +78,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_SIGNING_IDENTITY: ${{ startsWith(matrix.platform, 'macos-') && '-' || '' }}
+          # Belt and braces for the same problem: run the AppImage tools
+          # extracted instead of mounted, so this survives another image change.
+          APPIMAGE_EXTRACT_AND_RUN: 1
         with:
           tagName: ${{ github.ref_name }}
           releaseName: oardsh ${{ github.ref_name }}
