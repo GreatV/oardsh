@@ -828,8 +828,8 @@ fn show_clickable_notification(app: &AppHandle, title: &str, body: &str) {
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
-                    let _ = shown.wait_for_response(
-                        |response: &notify_rust::NotificationResponse| {
+                    let _ =
+                        shown.wait_for_response(|response: &notify_rust::NotificationResponse| {
                             if matches!(
                                 response,
                                 notify_rust::NotificationResponse::Default
@@ -837,8 +837,7 @@ fn show_clickable_notification(app: &AppHandle, title: &str, body: &str) {
                             ) {
                                 reveal_main(&handle);
                             }
-                        },
-                    );
+                        });
                 }
             }
             Err(_) => {
