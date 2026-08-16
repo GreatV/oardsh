@@ -18,7 +18,7 @@
   "tray.tooltip.approval": "oardsh — 需要审批",
   "tray.tooltip.question": "oardsh — 等待回答",
   "notification.tray.title": "oardsh 仍在运行",
-  "notification.tray.body": "窗口已收到托盘。退出 oardsh 之前，dsh 会继续工作。",
+  "notification.tray.body": "窗口已隐藏到托盘。退出 oardsh 之前，dsh 会继续工作。",
   "notification.restart.title": "dsh 已退出，正在重启",
   "notification.restart.body": "本地服务意外退出，oardsh 正在重新启动它。",
   "notification.peer.title": "已有另一个 dsh 在运行",

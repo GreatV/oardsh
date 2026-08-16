@@ -146,6 +146,10 @@ impl Engine {
         self.lock().generation
     }
 
+    pub fn suppress_raise(&self) {
+        self.lock().raise_on_ready = false;
+    }
+
     pub fn start(&self, app: &AppHandle) {
         self.start_with(app, true, true);
     }
@@ -349,8 +353,14 @@ impl Engine {
     }
 
     fn crash(&self, app: &AppHandle, generation: u64, code: i32) {
-        let visible = current_window(app)
+        let window = current_window(app);
+        let visible = window
+            .as_ref()
             .and_then(|window| window.is_visible().ok())
+            .unwrap_or(false);
+        let focused = window
+            .as_ref()
+            .and_then(|window| window.is_focused().ok())
             .unwrap_or(false);
         let auto = {
             let mut inner = self.lock();
@@ -393,7 +403,7 @@ impl Engine {
                     let _ = window.navigate(url.clone());
                 }
             }
-            self.start_with(app, visible, false);
+            self.start_with(app, focused, false);
             self.push_log(
                 "stdout",
                 format!("Auto-restarting after unexpected exit (code {code})"),
@@ -435,6 +445,11 @@ impl Engine {
         sidecar::clear();
         set_tray_tooltip(app, "tray.tooltip.stopped");
         emit_status(app, self);
+        // Always restore the boot page so a later tray reveal shows the
+        // failure UI, not a dead dsh URL. Do not raise a hidden window.
+        if let (Some(window), Some(url)) = (app.get_webview_window("main"), BOOT_URL.get()) {
+            let _ = window.navigate(url.clone());
+        }
     }
 
     fn try_reap(&self) -> Option<i32> {
@@ -672,6 +687,7 @@ fn request_attention(app: &AppHandle) {
 }
 
 pub fn note_hidden_to_tray(app: &AppHandle) {
+    app.state::<Engine>().suppress_raise();
     if sidecar::tray_hint_seen() {
         return;
     }
@@ -812,15 +828,17 @@ fn show_clickable_notification(app: &AppHandle, title: &str, body: &str) {
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
-                    let _ = shown.wait_for_response(|response| {
-                        if matches!(
-                            response,
-                            notify_rust::NotificationResponse::Default
-                                | notify_rust::NotificationResponse::Action(_)
-                        ) {
-                            reveal_main(&handle);
-                        }
-                    });
+                    let _ = shown.wait_for_response(
+                        |response: &notify_rust::NotificationResponse| {
+                            if matches!(
+                                response,
+                                notify_rust::NotificationResponse::Default
+                                    | notify_rust::NotificationResponse::Action(_)
+                            ) {
+                                reveal_main(&handle);
+                            }
+                        },
+                    );
                 }
             }
             Err(_) => {

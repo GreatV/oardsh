@@ -1,7 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(any(windows, target_os = "macos"))]
 use std::process::Command;
+#[cfg(unix)]
 use std::thread;
+#[cfg(unix)]
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -33,7 +36,7 @@ pub fn write(pid: u32, entry: &Path, url: Option<&str>) {
         url: url.map(str::to_string),
     };
     if let Ok(body) = serde_json::to_string(&record) {
-        let _ = fs::write(path, body);
+        persist_atomic(&path, body.as_bytes());
     }
 }
 
@@ -49,7 +52,7 @@ pub fn update_url(url: &str) {
     };
     record.url = Some(url.to_string());
     if let Ok(next) = serde_json::to_string(&record) {
-        let _ = fs::write(path, next);
+        persist_atomic(&path, next.as_bytes());
     }
 }
 
@@ -221,6 +224,23 @@ fn sidecar_path() -> Option<PathBuf> {
     paths::resolve_dsh_home().map(|home| PathBuf::from(home).join("oardsh.sidecar.json"))
 }
 
+/// Write via a sibling temp file, then rename. `fs::write` truncates first, so
+/// a crash mid-update would leave an unreadable record and a leaked dsh.
+fn persist_atomic(path: &Path, body: &[u8]) {
+    let tmp = path.with_extension("tmp");
+    if fs::write(&tmp, body).is_err() {
+        return;
+    }
+    if fs::rename(&tmp, path).is_ok() {
+        return;
+    }
+    // Windows cannot rename over an existing file.
+    let _ = fs::remove_file(path);
+    if fs::rename(&tmp, path).is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
 fn is_loopback_server(value: &str) -> bool {
     let Some(rest) = value.strip_prefix("http://") else {
         return false;
@@ -239,7 +259,8 @@ fn is_loopback_server(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{cmdline_owns_entry, is_loopback_server, Record};
+    use super::{cmdline_owns_entry, is_loopback_server, persist_atomic, Record};
+    use std::fs;
 
     #[test]
     fn identity_requires_the_entry_path() {
@@ -278,5 +299,26 @@ mod tests {
         assert_eq!(parsed, record);
         let legacy: Record = serde_json::from_str(r#"{"pid":1,"entry":"/dsh.js"}"#).unwrap();
         assert_eq!(legacy.url, None);
+    }
+
+    #[test]
+    fn persist_atomic_replaces_an_existing_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "oardsh-sidecar-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("oardsh.sidecar.json");
+        persist_atomic(&path, br#"{"pid":1,"entry":"/old.js"}"#);
+        persist_atomic(&path, br#"{"pid":2,"entry":"/new.js"}"#);
+        let body = fs::read_to_string(&path).unwrap();
+        let parsed: Record = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed.pid, 2);
+        assert_eq!(parsed.entry, "/new.js");
+        let _ = fs::remove_dir_all(dir);
     }
 }

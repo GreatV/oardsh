@@ -52,7 +52,32 @@ pub fn system_locale() -> &'static str {
             }
         }
     }
+    #[cfg(windows)]
+    {
+        if let Some(value) = windows_ui_locale() {
+            return normalize_locale(&value);
+        }
+    }
     "en"
+}
+
+/// Windows GUI launches do not set LANG. Use the display language, not the
+/// regional format locale, so a Chinese UI stays Chinese.
+#[cfg(windows)]
+fn windows_ui_locale() -> Option<String> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetUserDefaultUILanguage() -> u16;
+        fn LCIDToLocaleName(locale: u32, name: *mut u16, cch_name: i32, flags: u32) -> i32;
+    }
+    let langid = unsafe { GetUserDefaultUILanguage() };
+    let mut buf = [0u16; 85];
+    let len = unsafe { LCIDToLocaleName(u32::from(langid), buf.as_mut_ptr(), buf.len() as i32, 0) };
+    if len > 1 {
+        Some(String::from_utf16_lossy(&buf[..len as usize - 1]))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
