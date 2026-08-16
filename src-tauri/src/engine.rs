@@ -922,7 +922,10 @@ pub(crate) fn dsh_command(
     if is_node_script(program) {
         let node = paths::resolve_node(app)?;
         let mut command = Command::new(node);
-        command.arg(program).args(args);
+        // canonicalize() on Windows prefixes `\\?\`; Node 22+ then lstats `C:`.
+        command
+            .arg(paths::strip_windows_namespace(program.to_path_buf()))
+            .args(args);
         return Ok(command);
     }
     let mut command = Command::new(program);
