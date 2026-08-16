@@ -68,26 +68,37 @@ execFileSync(npmEntry ? process.execPath : "npm", npmEntry ? [npmEntry, ...args]
 // build. Both are dead weight, and the musl one is worse than that: linuxdeploy
 // resolves the dependencies of every ELF in the AppDir, and its unsatisfiable
 // libc.musl-x86_64.so.1 fails the AppImage bundle outright.
+// koffi names its two Linux builds after the libc, and picks between them by
+// reading the ELF interpreter of the node running it — the very binary this
+// script bundles. Detect the same thing, or a musl host would lose the only
+// build it can load.
+const isMuslHost =
+  process.platform === "linux" && !process.report?.getReport?.()?.header?.glibcVersionRuntime;
+const libc = process.platform === "linux" && isMuslHost ? "musl" : process.platform;
+
 const KEEP = new Set([
   `${process.platform}-${process.arch}`,
   `${process.platform}_${process.arch}`,
+  `${libc}-${process.arch}`,
+  `${libc}_${process.arch}`,
 ]);
 
-// A name is foreign when its leading platform/libc token is not ours, so
-// `linuxmusl-x64` and `musl_x64` are pruned on Linux while `linux_x64` stays.
+// A name is foreign when its leading platform/libc token is not ours. Matching
+// the token rather than a prefix keeps `linuxmusl-x64` foreign on glibc.
 function isForeignPrebuild(name) {
   const [token] = name.split(/[-_]/);
   return /^(darwin|linux|linuxmusl|win32|android|freebsd|musl)$/.test(token) && !KEEP.has(name);
 }
 
 function prunePrebuilds(dir, insidePrebuilds = false) {
+  const entries = readdirSync(dir, { withFileTypes: true }).filter((entry) => entry.isDirectory());
+  // Outside a prebuilds directory the name is only a selector if our own build
+  // sits beside it, so we can never delete the last one standing.
+  const oursIsHere = entries.some((entry) => KEEP.has(entry.name));
   const removed = [];
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    if (!entry.isDirectory()) continue;
+  for (const entry of entries) {
     const path = join(dir, entry.name);
-    // Only prune where the layout says the directory name selects a platform:
-    // inside a prebuilds/prebuilt directory, or a musl sibling of a real build.
-    if ((insidePrebuilds && isForeignPrebuild(entry.name)) || /^musl[-_]/.test(entry.name)) {
+    if (isForeignPrebuild(entry.name) && (insidePrebuilds || oursIsHere)) {
       removed.push(path);
       rmSync(path, { recursive: true, force: true });
     } else {
