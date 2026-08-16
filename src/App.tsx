@@ -6,7 +6,7 @@ import "./App.css";
 
 type Phase = "idle" | "starting" | "ready" | "stopping" | "error";
 type LogLine = { stream: string; line: string };
-type StatusEvent = { phase: Phase; url: string | null; error: string | null };
+type StatusEvent = { phase: Phase; url: string | null; error: string | null; crashed?: boolean };
 type Status = StatusEvent & { logs: LogLine[] };
 
 export default function App() {
@@ -24,6 +24,7 @@ export default function App() {
   }, []);
 
   const failed = status?.phase === "error" || Boolean(error);
+  const crashed = Boolean(status?.crashed);
 
   // The broadcast carries no logs; fetch them for the failure report only.
   useEffect(() => {
@@ -34,10 +35,11 @@ export default function App() {
   return (
     <main className="boot">
       <span className={`boot-mark ${failed ? "failed" : ""}`} aria-hidden="true" />
-      <h1>{failed ? t("boot.failed") : t("boot.starting")}</h1>
-      <p>{t("boot.description")}</p>
+      <h1>{failed ? (crashed ? t("boot.failedCrash") : t("boot.failed")) : t("boot.starting")}</h1>
+      <p>{failed && crashed ? t("boot.crashHint") : t("boot.description")}</p>
       {failed ? <pre>{error || status?.error}</pre> : null}
       {failed && logs.length ? <details><summary>{t("boot.details")}</summary><pre>{logs.slice(-20).map((item) => item.line).join("\n")}</pre></details> : null}
+      {failed ? <button type="button" className="boot-button" onClick={() => { setError(""); void invoke("restart_dsh"); }}>{t("boot.restart")}</button> : null}
     </main>
   );
 }

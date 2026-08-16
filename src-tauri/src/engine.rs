@@ -1,9 +1,9 @@
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
@@ -15,16 +15,32 @@ use tauri_plugin_notification::NotificationExt;
 
 use crate::i18n;
 use crate::paths;
+use crate::ready;
+use crate::sidecar;
 
 const LOG_LIMIT: usize = 400;
 const START_TIMEOUT: Duration = Duration::from_secs(120);
 /// The dsh page can call `native_web_event`, so its body is untrusted length.
 const NOTIFICATION_BODY_LIMIT: usize = 180;
 const HOST: &str = "127.0.0.1";
+const WATCH_INTERVAL: Duration = Duration::from_millis(400);
+const AUTO_RESTART_MAX: u32 = 1;
+const STABLE_AFTER: Duration = Duration::from_secs(30);
+/// Official `dsh web` default. A listener here that is not our sidecar is a
+/// second writer on ~/.dsh.
+const PEER_PORT: u16 = 3080;
 
 /// The main window's original URL, captured at setup so stopping can navigate
 /// back. It differs per platform and build, so it must not be hardcoded.
 static BOOT_URL: OnceLock<Url> = OnceLock::new();
+/// Dock/taskbar badge for approval/question while the window is hidden or
+/// unfocused. Cleared when the window is shown.
+static ATTENTION: AtomicU32 = AtomicU32::new(0);
+
+enum Supervised {
+    Spawned(Child),
+    Adopted { pid: u32, entry: PathBuf },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,6 +65,7 @@ pub struct Status {
     pub phase: Phase,
     pub url: Option<String>,
     pub error: Option<String>,
+    pub crashed: bool,
     pub logs: Vec<LogLine>,
 }
 
@@ -61,17 +78,23 @@ pub struct StatusEvent {
     phase: Phase,
     url: Option<String>,
     error: Option<String>,
+    crashed: bool,
 }
 
 struct Inner {
     phase: Phase,
     url: Option<String>,
     error: Option<String>,
-    child: Option<Child>,
+    crashed: bool,
+    supervised: Option<Supervised>,
     logs: VecDeque<LogLine>,
     /// Bumped on every start and stop. A launch thread carries the generation
     /// it was spawned for and stands down once it no longer matches.
     generation: u64,
+    auto_restarts: u32,
+    ready_at: Option<Instant>,
+    raise_on_ready: bool,
+    peer_dsh: bool,
 }
 
 impl Inner {
@@ -80,6 +103,7 @@ impl Inner {
             phase: self.phase,
             url: self.url.clone(),
             error: self.error.clone(),
+            crashed: self.crashed,
             logs: self.logs.iter().cloned().collect(),
         }
     }
@@ -98,9 +122,14 @@ impl Engine {
                 phase: Phase::Idle,
                 url: None,
                 error: None,
-                child: None,
+                crashed: false,
+                supervised: None,
                 logs: VecDeque::new(),
                 generation: 0,
+                auto_restarts: 0,
+                ready_at: None,
+                raise_on_ready: true,
+                peer_dsh: false,
             }),
         }
     }
@@ -118,6 +147,10 @@ impl Engine {
     }
 
     pub fn start(&self, app: &AppHandle) {
+        self.start_with(app, true, true);
+    }
+
+    fn start_with(&self, app: &AppHandle, raise: bool, reset_backoff: bool) {
         let generation = {
             let mut inner = self.lock();
             if matches!(inner.phase, Phase::Starting | Phase::Ready) {
@@ -127,9 +160,17 @@ impl Engine {
             inner.phase = Phase::Starting;
             inner.url = None;
             inner.error = None;
+            inner.crashed = false;
+            inner.ready_at = None;
+            inner.raise_on_ready = raise;
+            inner.peer_dsh = false;
+            if reset_backoff {
+                inner.auto_restarts = 0;
+            }
             inner.logs.clear();
             inner.generation
         };
+        set_tray_tooltip(app, "tray.tooltip.starting");
         emit_status(app, self);
 
         let handle = app.clone();
@@ -144,6 +185,25 @@ impl Engine {
     fn start_process(&self, app: &AppHandle, generation: u64) -> Result<(), String> {
         paths::ensure_desktop_plugin(app)?;
         let program = paths::resolve_dsh(app)?;
+        if let Some((pid, entry, url)) = sidecar::recover_ours(|candidate| {
+            Url::parse(candidate)
+                .ok()
+                .and_then(|parsed| parsed.port_or_known_default())
+                .is_some_and(|port| ready::dsh_serving(HOST, port))
+        }) {
+            {
+                let mut inner = self.lock();
+                if inner.generation != generation {
+                    return Ok(());
+                }
+                inner.supervised = Some(Supervised::Adopted { pid, entry });
+            }
+            self.push_log(
+                "stdout",
+                format!("Adopting leftover dsh pid {pid} at {url}"),
+            );
+            return self.mark_ready(app, generation, url);
+        }
         let patch = paths::desktop_patch(app)?;
         let host = HOST.to_string();
         let args = vec![
@@ -161,6 +221,18 @@ impl Engine {
             patch.display()
         );
         self.push_log("stdout", format!("Launching {display}"));
+        if ready::dsh_serving(HOST, PEER_PORT) {
+            {
+                let mut inner = self.lock();
+                if inner.generation == generation {
+                    inner.peer_dsh = true;
+                }
+            }
+            self.push_log(
+                "stdout",
+                "Another dsh is already serving on 127.0.0.1:3080; oardsh will use its own port. Running both can corrupt shared sessions.".into(),
+            );
+        }
 
         // dsh resolves working directories from its own registry; the server
         // just needs somewhere stable to run.
@@ -185,7 +257,8 @@ impl Engine {
                 kill_child(&mut child);
                 return Ok(());
             }
-            inner.child = Some(child);
+            sidecar::write(child.id(), &program, None);
+            inner.supervised = Some(Supervised::Spawned(child));
         }
 
         let started = Instant::now();
@@ -202,7 +275,7 @@ impl Engine {
                 }
             }
             if let Some((url, port)) = discovered.as_ref() {
-                if http_ready(&host, *port) {
+                if ready::dsh_serving(&host, *port) {
                     return self.mark_ready(app, generation, url.clone());
                 }
             }
@@ -226,37 +299,162 @@ impl Engine {
             inner.phase = Phase::Ready;
             inner.url = Some(url.clone());
             inner.error = None;
+            inner.crashed = false;
+            inner.ready_at = Some(Instant::now());
         }
+        sidecar::update_url(&url);
+        set_tray_tooltip(app, "tray.tooltip.ready");
         emit_status(app, self);
-        show_dsh(app, &url)
+        let raise = self.lock().raise_on_ready;
+        let peer = self.lock().peer_dsh;
+        present_dsh(app, &url, raise)?;
+        if peer {
+            let locale = i18n::system_locale();
+            show_clickable_notification(
+                app,
+                &i18n::translate(locale, "notification.peer.title"),
+                &i18n::translate(locale, "notification.peer.body"),
+            );
+        }
+        self.watch_ready(app, generation);
+        Ok(())
+    }
+
+    fn watch_ready(&self, app: &AppHandle, generation: u64) {
+        let handle = app.clone();
+        thread::spawn(move || loop {
+            thread::sleep(WATCH_INTERVAL);
+            let engine = handle.state::<Engine>();
+            if engine.generation() != generation {
+                return;
+            }
+            if !matches!(engine.status().phase, Phase::Ready) {
+                return;
+            }
+            {
+                let mut inner = engine.lock();
+                if inner.auto_restarts > 0 {
+                    if let Some(ready_at) = inner.ready_at {
+                        if ready_at.elapsed() >= STABLE_AFTER {
+                            inner.auto_restarts = 0;
+                        }
+                    }
+                }
+            }
+            if let Some(code) = engine.try_reap() {
+                engine.crash(&handle, generation, code);
+                return;
+            }
+        });
+    }
+
+    fn crash(&self, app: &AppHandle, generation: u64, code: i32) {
+        let visible = current_window(app)
+            .and_then(|window| window.is_visible().ok())
+            .unwrap_or(false);
+        let auto = {
+            let mut inner = self.lock();
+            if inner.generation != generation {
+                return;
+            }
+            inner.supervised = None;
+            inner.url = None;
+            inner.ready_at = None;
+            if inner.auto_restarts < AUTO_RESTART_MAX {
+                inner.auto_restarts += 1;
+                inner.phase = Phase::Idle;
+                inner.crashed = false;
+                inner.error = None;
+                true
+            } else {
+                inner.phase = Phase::Error;
+                inner.crashed = true;
+                let recent = inner
+                    .logs
+                    .iter()
+                    .rev()
+                    .take(24)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .map(|line| format!("[{}] {}", line.stream, line.line))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                inner.error = Some(format!("dsh exited while serving (code {code}).\n{recent}"));
+                false
+            }
+        };
+        sidecar::clear();
+        let locale = i18n::system_locale();
+        if auto {
+            if visible {
+                if let (Some(window), Some(url)) = (app.get_webview_window("main"), BOOT_URL.get())
+                {
+                    let _ = window.navigate(url.clone());
+                }
+            }
+            self.start_with(app, visible, false);
+            self.push_log(
+                "stdout",
+                format!("Auto-restarting after unexpected exit (code {code})"),
+            );
+            show_clickable_notification(
+                app,
+                &i18n::translate(locale, "notification.restart.title"),
+                &i18n::translate(locale, "notification.restart.body"),
+            );
+            return;
+        }
+        set_tray_tooltip(app, "tray.tooltip.stopped");
+        emit_status(app, self);
+        if let (Some(window), Some(url)) = (app.get_webview_window("main"), BOOT_URL.get()) {
+            let _ = window.navigate(url.clone());
+        }
+        reveal_main(app);
+        show_clickable_notification(
+            app,
+            &i18n::translate(locale, "notification.crash.title"),
+            &i18n::translate(locale, "notification.crash.body"),
+        );
     }
 
     fn fail(&self, app: &AppHandle, generation: u64, message: &str) {
-        let child = {
+        let supervised = {
             let mut inner = self.lock();
             if inner.generation != generation {
                 return;
             }
             inner.phase = Phase::Error;
+            inner.crashed = false;
             inner.error = Some(message.to_string());
-            inner.child.take()
+            inner.supervised.take()
         };
-        if let Some(mut child) = child {
-            kill_child(&mut child);
-            let _ = child.wait();
+        if let Some(mut supervised) = supervised {
+            kill_supervised(&mut supervised);
         }
+        sidecar::clear();
+        set_tray_tooltip(app, "tray.tooltip.stopped");
         emit_status(app, self);
     }
 
     fn try_reap(&self) -> Option<i32> {
         let mut inner = self.lock();
-        let child = inner.child.as_mut()?;
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                inner.child = None;
-                Some(status.code().unwrap_or(-1))
+        match inner.supervised.as_mut()? {
+            Supervised::Spawned(child) => match child.try_wait() {
+                Ok(Some(status)) => {
+                    inner.supervised = None;
+                    Some(status.code().unwrap_or(-1))
+                }
+                _ => None,
+            },
+            Supervised::Adopted { pid, .. } => {
+                if sidecar::pid_alive(*pid) {
+                    None
+                } else {
+                    inner.supervised = None;
+                    Some(-1)
+                }
             }
-            _ => None,
         }
     }
 
@@ -295,21 +493,23 @@ impl Engine {
     /// Stop the server. `release_window` returns the window to the boot screen;
     /// a window that is already closing must not be navigated.
     pub fn stop(&self, app: &AppHandle, release_window: bool) {
-        let (generation, child) = {
+        let (generation, supervised) = {
             let mut inner = self.lock();
-            if inner.phase == Phase::Idle && inner.child.is_none() {
+            if inner.phase == Phase::Idle && inner.supervised.is_none() {
                 return;
             }
             inner.generation += 1;
             inner.phase = Phase::Stopping;
             inner.url = None;
-            (inner.generation, inner.child.take())
+            inner.crashed = false;
+            (inner.generation, inner.supervised.take())
         };
         emit_status(app, self);
-        if let Some(mut child) = child {
-            kill_child(&mut child);
-            let _ = child.wait();
+        if let Some(mut supervised) = supervised {
+            kill_supervised(&mut supervised);
         }
+        sidecar::clear();
+        set_tray_tooltip(app, "tray.tooltip.stopped");
         {
             // A start() that raced in while the child was dying owns the phase
             // now; writing Idle would strand it as never started.
@@ -370,12 +570,31 @@ pub fn native_web_event(app: AppHandle, event: NativeWebEvent) {
     } else {
         truncate(event.body.trim(), NOTIFICATION_BODY_LIMIT)
     };
-    let _ = app
-        .notification()
-        .builder()
-        .title(&title)
-        .body(&body)
-        .show();
+    match event.kind.as_str() {
+        "approval" => set_tray_tooltip(&app, "tray.tooltip.approval"),
+        "question" => set_tray_tooltip(&app, "tray.tooltip.question"),
+        "completed" => set_tray_tooltip(&app, "tray.tooltip.ready"),
+        _ => {}
+    }
+    let alert = desktop_alert(
+        event.kind.as_str(),
+        window_in_background(&app),
+        window_is_concealed(&app),
+    );
+    if alert.badge {
+        add_attention(&app);
+    }
+    if alert.bounce {
+        request_attention(&app);
+    }
+    if alert.notify {
+        show_clickable_notification(&app, &title, &body);
+    }
+}
+
+#[tauri::command]
+pub fn restart_dsh(app: AppHandle) {
+    restart_from_menu(&app);
 }
 
 /// Cut on a character count, never a byte offset, so multi-byte input cannot panic.
@@ -396,6 +615,20 @@ pub fn boot_dsh(app: &AppHandle) {
     app.state::<Engine>().start(app);
 }
 
+pub fn quit_app(app: &AppHandle) {
+    app.state::<Engine>().stop(app, false);
+    app.exit(0);
+}
+
+pub fn reveal_main(app: &AppHandle) {
+    clear_attention(app);
+    if let Some(window) = current_window(app) {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
 fn emit_status(app: &AppHandle, engine: &Engine) {
     let status = engine.status();
     let _ = app.emit(
@@ -404,20 +637,51 @@ fn emit_status(app: &AppHandle, engine: &Engine) {
             phase: status.phase,
             url: status.url,
             error: status.error,
+            crashed: status.crashed,
         },
     );
 }
 
-/// Point the main window at the running server and bring it forward.
-fn show_dsh(app: &AppHandle, url: &str) -> Result<(), String> {
+/// Point the main window at the running server. `raise` is false when an
+/// auto-restart happens while the user left the window in the tray.
+fn present_dsh(app: &AppHandle, url: &str, raise: bool) -> Result<(), String> {
     let parsed = Url::parse(url).map_err(|err| err.to_string())?;
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "Main window is missing".to_string())?;
     window.navigate(parsed).map_err(|err| err.to_string())?;
-    let _ = window.unminimize();
-    window.show().map_err(|err| err.to_string())?;
-    window.set_focus().map_err(|err| err.to_string())
+    if raise {
+        let _ = window.unminimize();
+        window.show().map_err(|err| err.to_string())?;
+        window.set_focus().map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+fn set_tray_tooltip(app: &AppHandle, key: &str) {
+    let text = i18n::translate(i18n::system_locale(), key);
+    if let Some(tray) = app.tray_by_id("main") {
+        let _ = tray.set_tooltip(Some(text));
+    }
+}
+
+fn request_attention(app: &AppHandle) {
+    if let Some(window) = current_window(app) {
+        let _ = window.request_user_attention(Some(tauri::UserAttentionType::Informational));
+    }
+}
+
+pub fn note_hidden_to_tray(app: &AppHandle) {
+    if sidecar::tray_hint_seen() {
+        return;
+    }
+    sidecar::mark_tray_hint_seen();
+    let locale = i18n::system_locale();
+    show_clickable_notification(
+        app,
+        &i18n::translate(locale, "notification.tray.title"),
+        &i18n::translate(locale, "notification.tray.body"),
+    );
 }
 
 pub fn reload_main(app: &AppHandle) {
@@ -428,6 +692,147 @@ pub fn reload_main(app: &AppHandle) {
 
 pub fn current_window(app: &AppHandle) -> Option<WebviewWindow> {
     app.get_webview_window("main")
+}
+
+fn kill_supervised(supervised: &mut Supervised) {
+    match supervised {
+        Supervised::Spawned(child) => {
+            kill_child(child);
+            let _ = child.wait();
+        }
+        Supervised::Adopted { pid, entry } => sidecar::kill_if_ours(*pid, entry),
+    }
+}
+
+fn window_in_background(app: &AppHandle) -> bool {
+    match current_window(app) {
+        None => true,
+        Some(window) => {
+            !window.is_visible().unwrap_or(false) || !window.is_focused().unwrap_or(false)
+        }
+    }
+}
+
+fn window_is_concealed(app: &AppHandle) -> bool {
+    match current_window(app) {
+        None => true,
+        Some(window) => {
+            !window.is_visible().unwrap_or(false) || window.is_minimized().unwrap_or(false)
+        }
+    }
+}
+
+/// Completed turns only notify. Dock bounce is reserved for a hidden or
+/// minimized window that needs the user (approval / a question) — bouncing
+/// on every finished turn while oardsh is just unfocused is what made the
+/// macOS icon jump constantly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DesktopAlert {
+    notify: bool,
+    badge: bool,
+    bounce: bool,
+}
+
+fn desktop_alert(kind: &str, background: bool, concealed: bool) -> DesktopAlert {
+    if !background {
+        return DesktopAlert {
+            notify: false,
+            badge: false,
+            bounce: false,
+        };
+    }
+    let needs_action = matches!(kind, "approval" | "question");
+    DesktopAlert {
+        notify: true,
+        badge: needs_action,
+        bounce: needs_action && concealed,
+    }
+}
+
+fn add_attention(app: &AppHandle) {
+    if !window_in_background(app) {
+        return;
+    }
+    let count = ATTENTION.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    if let Some(window) = current_window(app) {
+        let _ = window.set_badge_count(Some(i64::from(count)));
+    }
+}
+
+pub fn clear_attention(app: &AppHandle) {
+    ATTENTION.store(0, Ordering::Relaxed);
+    if let Some(window) = current_window(app) {
+        let _ = window.set_badge_count(None);
+    }
+}
+
+fn show_clickable_notification(app: &AppHandle, title: &str, body: &str) {
+    let identifier = app.config().identifier.clone();
+    let title = title.to_string();
+    let body = body.to_string();
+    let handle = app.clone();
+    thread::spawn(move || {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = notify_rust::set_application(if tauri::is_dev() {
+                "com.apple.Terminal"
+            } else {
+                &identifier
+            });
+        }
+        let mut notification = notify_rust::Notification::new();
+        notification
+            .summary(&title)
+            .body(&body)
+            .action("default", "Open");
+        #[cfg(windows)]
+        {
+            let exe_dir = tauri::utils::platform::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|dir| dir.display().to_string()));
+            if let Some(dir) = exe_dir {
+                let sep = std::path::MAIN_SEPARATOR;
+                if !(dir.ends_with(&format!("{sep}target{sep}debug"))
+                    || dir.ends_with(&format!("{sep}target{sep}release")))
+                {
+                    notification.app_id(&identifier);
+                }
+            }
+        }
+        match notification.show() {
+            Ok(shown) => {
+                // macOS NSUserNotification delivers clicks on the main run
+                // loop; a worker thread would block forever. Reopen/Focused
+                // brings the window forward when the notification activates
+                // the app. Other platforms wait here.
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = shown;
+                    let _ = handle;
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = shown.wait_for_response(|response| {
+                        if matches!(
+                            response,
+                            notify_rust::NotificationResponse::Default
+                                | notify_rust::NotificationResponse::Action(_)
+                        ) {
+                            reveal_main(&handle);
+                        }
+                    });
+                }
+            }
+            Err(_) => {
+                let _ = handle
+                    .notification()
+                    .builder()
+                    .title(&title)
+                    .body(&body)
+                    .show();
+            }
+        }
+    });
 }
 
 fn spawn_reader<R: Read + Send + 'static>(
@@ -489,27 +894,6 @@ fn loopback_url(value: &str) -> Option<String> {
     }
 }
 
-fn http_ready(host: &str, port: u16) -> bool {
-    let address = format!("{host}:{port}");
-    let Ok(mut addrs) = address.to_socket_addrs() else {
-        return false;
-    };
-    let Some(addr) = addrs.next() else {
-        return false;
-    };
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(250)) else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
-    let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-    if stream.write_all(request.as_bytes()).is_err() {
-        return false;
-    }
-    let mut buf = [0u8; 24];
-    matches!(stream.read(&mut buf), Ok(n) if n >= 5 && buf.starts_with(b"HTTP/"))
-}
-
 pub(crate) fn dsh_command(
     app: &AppHandle,
     program: &Path,
@@ -537,7 +921,11 @@ pub(crate) fn configure_command(app: &AppHandle, command: &mut Command, workspac
             "HOME",
             paths::home_dir().unwrap_or_else(|| workspace.to_path_buf()),
         )
-        .env("CI", "1")
+        .env("CI", "1");
+    if let Some(home) = paths::resolve_dsh_home() {
+        command.env("DSH_HOME", home);
+    }
+    command
         .env("NPM_CONFIG_YES", "true")
         .env("NPM_CONFIG_UPDATE_NOTIFIER", "false")
         .env("NPM_CONFIG_PROGRESS", "false")
@@ -608,7 +996,7 @@ pub(crate) fn kill_child(child: &mut Child) {
 
 #[cfg(test)]
 mod tests {
-    use super::{announced_url, truncate};
+    use super::{announced_url, desktop_alert, truncate};
 
     #[test]
     fn truncates_on_character_boundaries() {
@@ -636,6 +1024,50 @@ mod tests {
         assert_eq!(
             announced_url("listening on http://127.0.0.1:8080."),
             Some("http://127.0.0.1:8080".into())
+        );
+    }
+
+    #[test]
+    fn desktop_alert_does_not_bounce_on_completed_or_unfocused_window() {
+        assert_eq!(
+            desktop_alert("completed", true, false),
+            super::DesktopAlert {
+                notify: true,
+                badge: false,
+                bounce: false
+            }
+        );
+        assert_eq!(
+            desktop_alert("completed", true, true),
+            super::DesktopAlert {
+                notify: true,
+                badge: false,
+                bounce: false
+            }
+        );
+        assert_eq!(
+            desktop_alert("approval", true, false),
+            super::DesktopAlert {
+                notify: true,
+                badge: true,
+                bounce: false
+            }
+        );
+        assert_eq!(
+            desktop_alert("question", true, true),
+            super::DesktopAlert {
+                notify: true,
+                badge: true,
+                bounce: true
+            }
+        );
+        assert_eq!(
+            desktop_alert("approval", false, true),
+            super::DesktopAlert {
+                notify: false,
+                badge: false,
+                bounce: false
+            }
         );
     }
 

@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "npm run build:plugin && vite",
     "build:plugin": "node packages/oardsh-dsh-plugin/scripts/build.mjs",
+    "test": "npm run build:plugin && node --test \"packages/oardsh-dsh-plugin/test/*.test.mjs\"",
     "build": "npm run build:plugin && tsc && vite build",
     "preview": "vite preview",
     "prepare-runtime": "node scripts/prepare-runtime.mjs",
@@ -23,6 +24,7 @@
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
+    "jsdom": "^29.1.1",
     "sharp": "^0.35.3",
     "typescript": "~5.8.3",
     "vite": "^7.0.4"

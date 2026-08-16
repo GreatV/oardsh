@@ -30,6 +30,12 @@ jobs:
           cp packages/oardsh-dsh-plugin/lib/client.js "${RUNNER_TEMP}/client.js"
           npm run build:plugin
           diff "${RUNNER_TEMP}/client.js" packages/oardsh-dsh-plugin/lib/client.js
+      # The plugin decorates dsh surfaces that no slot exposes, and dsh ships
+      # breaking changes during the preview. These hold the injections against
+      # the dsh that is installed, so a bump that moves the markup fails here
+      # rather than in a user's panel.
+      - name: Plugin contract tests
+        run: npm test
 
   rust:
     name: Rust
