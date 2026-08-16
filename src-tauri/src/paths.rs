@@ -90,7 +90,7 @@ pub fn bundled_node(app: &AppHandle) -> Option<PathBuf> {
         for name in names {
             let candidate = dir.join(name);
             if is_executable(&candidate) {
-                return fs::canonicalize(candidate).ok();
+                return canonicalize_for_child(&candidate);
             }
         }
     }
@@ -154,7 +154,7 @@ pub fn desktop_patch(app: &AppHandle) -> Result<PathBuf, String> {
     candidates
         .into_iter()
         .find(|path| path.is_file())
-        .and_then(|path| fs::canonicalize(path).ok())
+        .and_then(canonicalize_for_child)
         .ok_or_else(|| "oardsh dsh plugin patch is missing".to_string())
 }
 
@@ -236,7 +236,7 @@ fn locate_dsh_near(root: &Path) -> Option<PathBuf> {
     for _ in 0..10 {
         let candidate = dir.join(DSH_ENTRY);
         if candidate.is_file() {
-            return fs::canonicalize(candidate).ok();
+            return canonicalize_for_child(&candidate);
         }
         match dir.parent() {
             Some(parent) => dir = parent.to_path_buf(),
@@ -244,6 +244,44 @@ fn locate_dsh_near(root: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Resolve a path for a child process. Windows `canonicalize` returns
+/// `\\?\C:\...`; Node 22+ `realpathSync` parses that as UNC and `lstat`s `C:`.
+fn canonicalize_for_child(path: impl AsRef<Path>) -> Option<PathBuf> {
+    fs::canonicalize(path.as_ref())
+        .ok()
+        .map(strip_windows_namespace)
+}
+
+/// Drop the Windows extended-length prefix so Node and other Win32 programs
+/// see a normal drive path. `\\?\C:\foo` → `C:\foo`, `\\?\UNC\s\sh\foo` →
+/// `\\s\sh\foo`. Other paths are left unchanged.
+pub(crate) fn strip_windows_namespace(path: PathBuf) -> PathBuf {
+    path.to_str()
+        .and_then(strip_windows_namespace_str)
+        .map(PathBuf::from)
+        .unwrap_or(path)
+}
+
+fn strip_windows_namespace_str(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let is_namespace = bytes.len() >= 4
+        && matches!(bytes[0], b'\\' | b'/')
+        && matches!(bytes[1], b'\\' | b'/')
+        && bytes[2] == b'?'
+        && matches!(bytes[3], b'\\' | b'/');
+    if !is_namespace {
+        return None;
+    }
+    let rest = &path[4..];
+    if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case("UNC\\") {
+        return Some(format!(r"\\{}", &rest[4..]));
+    }
+    if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case("UNC/") {
+        return Some(format!(r"\\{}", &rest[4..]));
+    }
+    Some(rest.to_string())
 }
 
 fn package_bin_dir(dsh_entry: &Path) -> Option<PathBuf> {
@@ -352,4 +390,52 @@ fn version_key(name: &str) -> (u64, u64, u64) {
     let minor = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let patch = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     (major, minor, patch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{canonicalize_for_child, strip_windows_namespace, strip_windows_namespace_str};
+    use std::path::PathBuf;
+
+    #[test]
+    fn strips_verbatim_disk_paths() {
+        assert_eq!(
+            strip_windows_namespace_str(r"\\?\C:\Users\Vince\bin.js").as_deref(),
+            Some(r"C:\Users\Vince\bin.js")
+        );
+        assert_eq!(
+            strip_windows_namespace_str(r"//?/C:/Users/Vince/bin.js").as_deref(),
+            Some(r"C:/Users/Vince/bin.js")
+        );
+    }
+
+    #[test]
+    fn strips_verbatim_unc_paths() {
+        assert_eq!(
+            strip_windows_namespace_str(r"\\?\UNC\server\share\foo.js").as_deref(),
+            Some(r"\\server\share\foo.js")
+        );
+    }
+
+    #[test]
+    fn leaves_ordinary_paths_alone() {
+        assert_eq!(strip_windows_namespace_str(r"C:\Users\Vince\bin.js"), None);
+        assert_eq!(strip_windows_namespace_str("/usr/bin/node"), None);
+        assert_eq!(
+            strip_windows_namespace(PathBuf::from(r"C:\Users\Vince\bin.js")),
+            PathBuf::from(r"C:\Users\Vince\bin.js")
+        );
+    }
+
+    #[test]
+    fn canonicalize_for_child_does_not_keep_verbatim_prefix() {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/paths.rs");
+        let resolved = canonicalize_for_child(&manifest).expect("paths.rs exists");
+        let text = resolved.to_string_lossy();
+        assert!(
+            !text.starts_with(r"\\?\"),
+            "child path still has a verbatim prefix: {text}"
+        );
+        assert!(resolved.is_file());
+    }
 }
