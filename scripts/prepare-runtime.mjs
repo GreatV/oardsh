@@ -1,4 +1,4 @@
-import { cpSync, chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, chmodSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
@@ -62,5 +62,57 @@ execFileSync(npmEntry ? process.execPath : "npm", npmEntry ? [npmEntry, ...args]
   shell: !npmEntry && process.platform === "win32",
 });
 
+// Packages that carry a platform suffix in their *name* are already filtered by
+// npm's os/cpu fields, so only two layouts ship foreign binaries: prebuildify's
+// `prebuilds/<platform>-<arch>/`, and koffi's `<libc>_<arch>/` beside the glibc
+// build. Both are dead weight, and the musl one is worse than that: linuxdeploy
+// resolves the dependencies of every ELF in the AppDir, and its unsatisfiable
+// libc.musl-x86_64.so.1 fails the AppImage bundle outright.
+// koffi names its two Linux builds after the libc, and picks between them by
+// reading the ELF interpreter of the node running it — the very binary this
+// script bundles. Detect the same thing, or a musl host would lose the only
+// build it can load.
+const isMuslHost =
+  process.platform === "linux" && !process.report?.getReport?.()?.header?.glibcVersionRuntime;
+const libc = process.platform === "linux" && isMuslHost ? "musl" : process.platform;
+
+const KEEP = new Set([
+  `${process.platform}-${process.arch}`,
+  `${process.platform}_${process.arch}`,
+  `${libc}-${process.arch}`,
+  `${libc}_${process.arch}`,
+]);
+
+// A name is foreign when its leading platform/libc token is not ours. Matching
+// the token rather than a prefix keeps `linuxmusl-x64` foreign on glibc.
+function isForeignPrebuild(name) {
+  const [token] = name.split(/[-_]/);
+  return /^(darwin|linux|linuxmusl|win32|android|freebsd|musl)$/.test(token) && !KEEP.has(name);
+}
+
+function prunePrebuilds(dir, insidePrebuilds = false) {
+  const entries = readdirSync(dir, { withFileTypes: true }).filter((entry) => entry.isDirectory());
+  // Outside a prebuilds directory the name is only a selector if our own build
+  // sits beside it, so we can never delete the last one standing.
+  const oursIsHere = entries.some((entry) => KEEP.has(entry.name));
+  const removed = [];
+  for (const entry of entries) {
+    const path = join(dir, entry.name);
+    if (isForeignPrebuild(entry.name) && (insidePrebuilds || oursIsHere)) {
+      removed.push(path);
+      rmSync(path, { recursive: true, force: true });
+    } else {
+      removed.push(...prunePrebuilds(path, entry.name === "prebuilds" || entry.name === "prebuilt"));
+    }
+  }
+  return removed;
+}
+
+const pruned = prunePrebuilds(join(dshDir, "node_modules"));
+for (const path of pruned) {
+  console.log(`Pruned foreign prebuild ${path.slice(dshDir.length + 1)}`);
+}
+
 console.log(`Prepared runtime node at ${nodeDest}`);
 console.log(`Prepared dsh ${spec} at ${dshDir}`);
+console.log(`Pruned ${pruned.length} foreign prebuild director${pruned.length === 1 ? "y" : "ies"}`);
