@@ -90,7 +90,9 @@ pub fn bundled_node(app: &AppHandle) -> Option<PathBuf> {
         for name in names {
             let candidate = dir.join(name);
             if is_executable(&candidate) {
-                return canonicalize_for_child(&candidate);
+                // Keep the `\\?\` prefix: CreateProcessW accepts it, and a
+                // stripped path longer than MAX_PATH will not start.
+                return fs::canonicalize(candidate).ok();
             }
         }
     }
@@ -120,7 +122,7 @@ pub fn path_with_package_bins(app: &AppHandle) -> OsString {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Ok(node) = resolve_node(app) {
         if let Some(dir) = node.parent() {
-            dirs.push(dir.to_path_buf());
+            dirs.push(strip_windows_namespace(dir.to_path_buf()));
         }
     }
     if let Some(dsh) = bundled_dsh(app) {
@@ -246,8 +248,9 @@ fn locate_dsh_near(root: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Resolve a path for a child process. Windows `canonicalize` returns
-/// `\\?\C:\...`; Node 22+ `realpathSync` parses that as UNC and `lstat`s `C:`.
+/// Resolve a path that will be a Node *argument* (script, --patch). Windows
+/// `canonicalize` returns `\\?\C:\...`; Node 22+ `realpathSync` parses that
+/// as UNC and `lstat`s `C:`. The Node executable itself keeps the prefix.
 fn canonicalize_for_child(path: impl AsRef<Path>) -> Option<PathBuf> {
     fs::canonicalize(path.as_ref())
         .ok()
