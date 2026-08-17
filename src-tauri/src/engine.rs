@@ -201,12 +201,15 @@ impl Engine {
     fn start_process(&self, app: &AppHandle, generation: u64) -> Result<(), String> {
         paths::ensure_desktop_plugin(app)?;
         let program = paths::resolve_dsh(app)?;
-        if let Some((pid, entry, url)) = sidecar::recover_ours(|candidate| {
-            Url::parse(candidate)
-                .ok()
-                .and_then(|parsed| parsed.port_or_known_default())
-                .is_some_and(|port| ready::dsh_serving(HOST, port))
-        }) {
+        if let Some((pid, entry, url)) = sidecar::recover_ours(
+            |candidate| {
+                Url::parse(candidate)
+                    .ok()
+                    .and_then(|parsed| parsed.port_or_known_default())
+                    .is_some_and(|port| ready::dsh_serving(HOST, port))
+            },
+            &proxy::fingerprint(&proxy::load()),
+        ) {
             {
                 let mut inner = self.lock();
                 if inner.generation != generation {
@@ -273,7 +276,12 @@ impl Engine {
                 kill_child(&mut child);
                 return Ok(());
             }
-            sidecar::write(child.id(), &program, None);
+            sidecar::write(
+                child.id(),
+                &program,
+                None,
+                Some(&proxy::fingerprint(&proxy::load())),
+            );
             inner.supervised = Some(Supervised::Spawned(child));
         }
 

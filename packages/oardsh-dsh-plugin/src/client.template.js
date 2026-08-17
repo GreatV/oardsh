@@ -528,9 +528,10 @@ window.__ModuleLoader__.load({
         try {
           const config = await invoke("set_proxy_config", { mode, url, noProxy });
           setSaved(config);
-          await invoke("restart_dsh");
         } catch (reason) {
-          setError(String(reason).replace(/^Error:\s*/, ""));
+          const message = String(reason).replace(/^Error:\s*/, "");
+          if (message === "Cancelled") return;
+          setError(message);
         } finally {
           setBusy(false);
         }

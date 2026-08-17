@@ -21,9 +21,11 @@ struct Record {
     entry: String,
     #[serde(default)]
     url: Option<String>,
+    #[serde(default)]
+    proxy: Option<String>,
 }
 
-pub fn write(pid: u32, entry: &Path, url: Option<&str>) {
+pub fn write(pid: u32, entry: &Path, url: Option<&str>, proxy: Option<&str>) {
     let Some(path) = sidecar_path() else {
         return;
     };
@@ -34,6 +36,7 @@ pub fn write(pid: u32, entry: &Path, url: Option<&str>) {
         pid,
         entry: entry.display().to_string(),
         url: url.map(str::to_string),
+        proxy: proxy.map(str::to_string),
     };
     if let Ok(body) = serde_json::to_string(&record) {
         let _ = persist_atomic(&path, body.as_bytes());
@@ -84,12 +87,20 @@ pub fn mark_tray_hint_seen() {
 /// If a leftover process is ours and still serving, return it so the engine
 /// can attach. If it is ours but not serving, kill only that process. A live
 /// process whose command line is not our entry is left alone.
-pub fn recover_ours(ready: impl Fn(&str) -> bool) -> Option<(u32, PathBuf, String)> {
+pub fn recover_ours(
+    ready: impl Fn(&str) -> bool,
+    expected_proxy: &str,
+) -> Option<(u32, PathBuf, String)> {
     let path = sidecar_path()?;
     recover_backup(&path);
     let body = fs::read_to_string(&path).ok()?;
     let record = serde_json::from_str::<Record>(&body).ok()?;
     let entry = PathBuf::from(&record.entry);
+    if record.proxy.as_deref() != Some(expected_proxy) {
+        kill_if_ours(record.pid, &entry);
+        let _ = fs::remove_file(&path);
+        return None;
+    }
     if !pid_alive(record.pid) {
         let _ = fs::remove_file(path);
         return None;
@@ -337,12 +348,14 @@ mod tests {
             pid: 4242,
             entry: "/opt/dsh/lib/bin.js".into(),
             url: Some("http://127.0.0.1:41234".into()),
+            proxy: Some("system||".into()),
         };
         let body = serde_json::to_string(&record).unwrap();
         let parsed: Record = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed, record);
         let legacy: Record = serde_json::from_str(r#"{"pid":1,"entry":"/dsh.js"}"#).unwrap();
         assert_eq!(legacy.url, None);
+        assert_eq!(legacy.proxy, None);
     }
 
     #[test]

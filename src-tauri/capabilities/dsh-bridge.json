@@ -10,7 +10,6 @@
     "allow-native-web-event",
     "allow-token-usage",
     "allow-proxy-config",
-    "allow-set-proxy-config",
-    "allow-restart-dsh"
+    "allow-set-proxy-config"
   ]
 }

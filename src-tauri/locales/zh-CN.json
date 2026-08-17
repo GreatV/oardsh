@@ -33,5 +33,7 @@
   "menu.reload": "重新加载",
   "menu.docs": "GitHub 上的 DeepSeek Harness",
   "menu.guide": "Web UI 指南",
-  "menu.devtools": "开发者工具"
+  "menu.devtools": "开发者工具",
+  "proxy.confirm.title": "应用网络代理？",
+  "proxy.confirm.body": "oardsh 会保存该代理设置并重启 dsh。取消则保持当前路由。"
 }

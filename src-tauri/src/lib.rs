@@ -27,6 +27,7 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(Engine::new())
         .invoke_handler(tauri::generate_handler![
             engine::dsh_status,

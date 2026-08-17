@@ -10,6 +10,7 @@ const LOOPBACK: &[&str] = &["localhost", "127.0.0.1", "::1", "[::1]"];
 /// Well under the Windows environment-block limit, so a huge paste cannot
 /// make the next spawn fail and lock the user out of Settings.
 const NO_PROXY_MAX: usize = 2048;
+const MERGED_NO_PROXY_MAX: usize = 4096;
 const PROXY_VARS: &[&str] = &[
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -88,21 +89,28 @@ fn env_ops(
             .collect(),
         ProxyMode::System => {
             let no_proxy = merge_no_proxy(&inherited.no_proxy);
+            let http = if inherited.http.is_empty() {
+                inherited.all.clone()
+            } else {
+                inherited.http.clone()
+            };
+            let https = if inherited.https.is_empty() {
+                inherited.all.clone()
+            } else {
+                inherited.https.clone()
+            };
             let mut ops = vec![
                 ("NODE_USE_ENV_PROXY", Some("1".into())),
                 ("NO_PROXY", Some(no_proxy.clone())),
                 ("no_proxy", Some(no_proxy)),
             ];
-            // Node's env-proxy reads HTTP(S)_PROXY, not ALL_PROXY.
-            if !inherited.all.is_empty() {
-                if inherited.http.is_empty() {
-                    ops.push(("HTTP_PROXY", Some(inherited.all.clone())));
-                    ops.push(("http_proxy", Some(inherited.all.clone())));
-                }
-                if inherited.https.is_empty() {
-                    ops.push(("HTTPS_PROXY", Some(inherited.all.clone())));
-                    ops.push(("https_proxy", Some(inherited.all.clone())));
-                }
+            if !http.is_empty() {
+                ops.push(("HTTP_PROXY", Some(http.clone())));
+                ops.push(("http_proxy", Some(http)));
+            }
+            if !https.is_empty() {
+                ops.push(("HTTPS_PROXY", Some(https.clone())));
+                ops.push(("https_proxy", Some(https)));
             }
             ops
         }
@@ -159,11 +167,20 @@ fn inherited_proxy() -> InheritedProxy {
         format!("{no_upper},{no_lower}")
     };
     InheritedProxy {
-        http: first_env(&["HTTP_PROXY", "http_proxy"]),
-        https: first_env(&["HTTPS_PROXY", "https_proxy"]),
-        all: first_env(&["ALL_PROXY", "all_proxy"]),
+        http: first_env(&["http_proxy", "HTTP_PROXY"]),
+        https: first_env(&["https_proxy", "HTTPS_PROXY"]),
+        all: first_env(&["all_proxy", "ALL_PROXY"]),
         no_proxy,
     }
+}
+
+pub fn fingerprint(config: &ProxyConfig) -> String {
+    let mode = match config.mode {
+        ProxyMode::System => "system",
+        ProxyMode::Off => "off",
+        ProxyMode::Manual => "manual",
+    };
+    format!("{mode}|{}|{}", config.url, config.no_proxy)
 }
 
 fn merge_no_proxy(user: &str) -> String {
@@ -180,7 +197,18 @@ fn merge_no_proxy(user: &str) -> String {
             parts.push(trimmed.to_string());
         }
     }
-    parts.join(",")
+    let mut merged = String::new();
+    for part in parts {
+        let next_len = merged.len() + part.len() + usize::from(!merged.is_empty());
+        if next_len > MERGED_NO_PROXY_MAX {
+            break;
+        }
+        if !merged.is_empty() {
+            merged.push(',');
+        }
+        merged.push_str(&part);
+    }
+    merged
 }
 
 fn validate_proxy_url(raw: &str) -> Result<String, String> {
@@ -310,15 +338,31 @@ pub fn set_proxy_config(
             );
         }
     }
+    if !confirm_apply(&app) {
+        return Err("Cancelled".into());
+    }
     save(&config)?;
+    crate::engine::restart_from_menu(&app);
     Ok(view(&app, config))
+}
+
+fn confirm_apply(app: &tauri::AppHandle) -> bool {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    let locale = crate::i18n::system_locale();
+    app.dialog()
+        .message(crate::i18n::translate(locale, "proxy.confirm.body"))
+        .title(crate::i18n::translate(locale, "proxy.confirm.title"))
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancel)
+        .blocking_show()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         env_ops, merge_no_proxy, node_env_proxy_ok, redact_proxy_url, validate_no_proxy,
-        validate_proxy_url, InheritedProxy, ProxyConfig, ProxyMode, NO_PROXY_MAX,
+        validate_proxy_url, InheritedProxy, ProxyConfig, ProxyMode, MERGED_NO_PROXY_MAX,
+        NO_PROXY_MAX,
     };
 
     #[test]
@@ -443,12 +487,29 @@ mod tests {
                 ..InheritedProxy::default()
             },
         );
-        assert!(ops.iter().all(|(name, _)| *name != "HTTP_PROXY"));
+        let http = ops
+            .iter()
+            .find(|(name, _)| *name == "HTTP_PROXY")
+            .and_then(|(_, value)| value.as_deref());
+        assert_eq!(http, Some("http://already:8080"));
+        let http_lc = ops
+            .iter()
+            .find(|(name, _)| *name == "http_proxy")
+            .and_then(|(_, value)| value.as_deref());
+        assert_eq!(http_lc, Some("http://already:8080"));
         let https = ops
             .iter()
             .find(|(name, _)| *name == "HTTPS_PROXY")
             .and_then(|(_, value)| value.as_deref());
         assert_eq!(https, Some("http://127.0.0.1:7890"));
+    }
+
+    #[test]
+    fn merged_no_proxy_stays_bounded() {
+        let huge = format!("localhost,{}", "x.example,".repeat(800));
+        let merged = merge_no_proxy(&huge);
+        assert!(merged.contains("localhost"));
+        assert!(merged.len() <= MERGED_NO_PROXY_MAX);
     }
 
     #[test]

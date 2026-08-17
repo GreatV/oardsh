@@ -33,5 +33,7 @@
   "menu.reload": "Reload",
   "menu.docs": "DeepSeek Harness on GitHub",
   "menu.guide": "Web UI Guide",
-  "menu.devtools": "Toggle Developer Tools"
+  "menu.devtools": "Toggle Developer Tools",
+  "proxy.confirm.title": "Apply network proxy?",
+  "proxy.confirm.body": "oardsh will save this proxy setting and restart dsh. Cancel to keep the current routing."
 }
