@@ -151,12 +151,23 @@ impl Engine {
     }
 
     pub fn start(&self, app: &AppHandle) {
-        self.start_with(app, true, true);
+        self.start_with(app, true, true, None);
     }
 
-    fn start_with(&self, app: &AppHandle, raise: bool, reset_backoff: bool) {
+    fn start_with(
+        &self,
+        app: &AppHandle,
+        raise: bool,
+        reset_backoff: bool,
+        expected_generation: Option<u64>,
+    ) {
         let generation = {
             let mut inner = self.lock();
+            if let Some(expected) = expected_generation {
+                if inner.generation != expected {
+                    return;
+                }
+            }
             if matches!(inner.phase, Phase::Starting | Phase::Ready) {
                 return;
             }
@@ -362,7 +373,7 @@ impl Engine {
             .as_ref()
             .and_then(|window| window.is_focused().ok())
             .unwrap_or(false);
-        let auto = {
+        let (auto, gen_at_crash) = {
             let mut inner = self.lock();
             if inner.generation != generation {
                 return;
@@ -375,7 +386,7 @@ impl Engine {
                 inner.phase = Phase::Idle;
                 inner.crashed = false;
                 inner.error = None;
-                true
+                (true, inner.generation)
             } else {
                 inner.phase = Phase::Error;
                 inner.crashed = true;
@@ -391,7 +402,7 @@ impl Engine {
                     .collect::<Vec<_>>()
                     .join("\n");
                 inner.error = Some(format!("dsh exited while serving (code {code}).\n{recent}"));
-                false
+                (false, inner.generation)
             }
         };
         sidecar::clear();
@@ -403,7 +414,7 @@ impl Engine {
                     let _ = window.navigate(url.clone());
                 }
             }
-            self.start_with(app, focused, false);
+            self.start_with(app, focused, false, Some(gen_at_crash));
             self.push_log(
                 "stdout",
                 format!("Auto-restarting after unexpected exit (code {code})"),
@@ -510,10 +521,12 @@ impl Engine {
     pub fn stop(&self, app: &AppHandle, release_window: bool) {
         let (generation, supervised) = {
             let mut inner = self.lock();
+            // Always bump: crash() drops to Idle before start_with, and a
+            // quit in that window must invalidate the pending restart.
+            inner.generation += 1;
             if inner.phase == Phase::Idle && inner.supervised.is_none() {
                 return;
             }
-            inner.generation += 1;
             inner.phase = Phase::Stopping;
             inner.url = None;
             inner.crashed = false;
@@ -622,8 +635,11 @@ fn truncate(value: &str, limit: usize) -> String {
 
 pub fn restart_from_menu(app: &AppHandle) {
     let engine = app.state::<Engine>();
+    let raise = current_window(app)
+        .and_then(|window| window.is_visible().ok())
+        .unwrap_or(false);
     engine.stop(app, true);
-    engine.start(app);
+    engine.start_with(app, raise, true, None);
 }
 
 pub fn boot_dsh(app: &AppHandle) {
