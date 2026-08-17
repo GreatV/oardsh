@@ -8,7 +8,7 @@
   "notification.updated.title": "dsh status changed",
   "notification.updated.body": "Agent status updated",
   "notification.crash.title": "dsh stopped unexpectedly",
-  "notification.crash.body": "The local server exited. Open oardsh to see the log and restart.",
+  "notification.crash.body": "The local server exited. Open oardsh for details and restart.",
   "tray.show": "Show oardsh",
   "tray.restart": "Restart Server",
   "tray.quit": "Quit oardsh",
@@ -18,11 +18,11 @@
   "tray.tooltip.approval": "oardsh — needs approval",
   "tray.tooltip.question": "oardsh — waiting for an answer",
   "notification.tray.title": "oardsh is still running",
-  "notification.tray.body": "The window is in the tray. dsh keeps working until you quit oardsh.",
+  "notification.tray.body": "The window is hidden in the tray. The server keeps running until you quit oardsh.",
   "notification.restart.title": "dsh stopped — restarting",
-  "notification.restart.body": "The local server exited. oardsh is starting it again.",
+  "notification.restart.body": "The local server exited unexpectedly. oardsh is restarting it.",
   "notification.peer.title": "Another dsh is already running",
-  "notification.peer.body": "Something is serving dsh on port 3080. oardsh started its own copy; running both can corrupt sessions.",
+  "notification.peer.body": "Another dsh instance is already running. oardsh started on a different port. Running both may corrupt session data.",
   "menu.file": "File",
   "menu.edit": "Edit",
   "menu.view": "View",
@@ -34,6 +34,7 @@
   "menu.docs": "DeepSeek Harness on GitHub",
   "menu.guide": "Web UI Guide",
   "menu.devtools": "Toggle Developer Tools",
-  "proxy.confirm.title": "Apply network proxy?",
-  "proxy.confirm.body": "oardsh will save this proxy setting and restart dsh. Cancel to keep the current routing."
+  "proxy.confirm.title": "Apply proxy settings?",
+  "proxy.confirm.body": "This saves the proxy settings and restarts the server. Cancel to keep the current settings.",
+  "proxy.error.unsupported": "Manual proxy is not available in this environment."
 }

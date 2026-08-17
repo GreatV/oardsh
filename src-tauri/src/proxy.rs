@@ -346,9 +346,10 @@ pub fn set_proxy_config(
     if config.mode == ProxyMode::Manual {
         config.url = validate_proxy_url(&config.url)?;
         if !node_supports_env_proxy(&app) {
-            return Err(
-                "Manual proxy needs Node 22.21 or later, or a packaged oardsh runtime.".into(),
-            );
+            return Err(crate::i18n::translate(
+                crate::i18n::system_locale(),
+                "proxy.error.unsupported",
+            ));
         }
     }
     if !confirm_apply(&app) {

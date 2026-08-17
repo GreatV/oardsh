@@ -540,7 +540,7 @@ window.__ModuleLoader__.load({
         h("span", { className: "oardsh-mark", "aria-hidden": true, title: "oardsh" }),
         h("div", { className: "oardsh-general-text" },
           h("div", { className: "oardsh-general-title" }, t("proxy.title")),
-          h("div", { className: "oardsh-general-help" }, native ? t("proxy.help") : t("unavailable")),
+          h("div", { className: "oardsh-general-help" }, native ? t("proxy.help") : t("proxy.unavailable")),
           native && h("div", { className: "oardsh-general-fields" },
             h("div", { className: "oardsh-switch" }, ["off", "system", "manual"].map((value) => h("button", {
               type: "button", key: value, "data-active": mode === value || undefined,

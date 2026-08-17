@@ -2,8 +2,8 @@
   "boot.starting": "正在启动 dsh Web…",
   "boot.failed": "dsh Web 启动失败",
   "boot.failedCrash": "dsh Web 意外退出",
-  "boot.description": "oardsh 会在当前窗口打开 dsh Web。关闭窗口只会藏到托盘，dsh 继续跑。",
-  "boot.crashHint": "若有会话卡在运行中，重启后打开该会话并手动停止。",
+  "boot.description": "oardsh 将在此窗口打开 dsh Web。关闭窗口后，应用会转入系统托盘并继续运行。",
+  "boot.crashHint": "若会话仍显示为运行中，请在重新启动后打开该会话并停止。",
   "boot.details": "启动详情",
   "boot.restart": "重新启动"
 }
