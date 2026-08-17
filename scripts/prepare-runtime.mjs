@@ -17,6 +17,16 @@ if (!spec) {
   throw new Error("package-lock.json does not pin @deepseek-ai/dsh; run npm install");
 }
 
+// dsh's own package.json uses ^ ranges. A sibling @deepseek-ai/* rc can
+// publish before its peers, and a lockless install then asks for a version
+// that is not on the registry. Force every scoped package to the root lock.
+const deepseekPins = {};
+for (const [path, pkg] of Object.entries(lock.packages ?? {})) {
+  if (!pkg.version || !path.startsWith("node_modules/@deepseek-ai/")) continue;
+  if (path.slice("node_modules/@deepseek-ai/".length).includes("/")) continue;
+  deepseekPins[path.slice("node_modules/".length)] = pkg.version;
+}
+
 mkdirSync(runtimeDir, { recursive: true });
 const nodeName = process.platform === "win32" ? "node.exe" : "node";
 const nodeDest = join(runtimeDir, nodeName);
@@ -42,6 +52,7 @@ writeFileSync(
         "@deepseek-ai/dsh": spec,
         "@oardsh/dsh-plugin": "file:plugins/oardsh-dsh-plugin",
       },
+      overrides: deepseekPins,
     },
     null,
     2,
