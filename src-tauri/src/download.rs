@@ -21,7 +21,7 @@ pub fn handle(webview: Webview<Wry>, event: DownloadEvent<'_>) -> bool {
             match pick_destination(&webview, &url, destination) {
                 Some(path) => {
                     remember(url.as_str(), path.clone());
-                    *destination = path;
+                    *destination = staging_destination(url.as_str(), path);
                     true
                 }
                 None => {
@@ -105,6 +105,82 @@ fn arrived(url: &str) -> bool {
         .is_some_and(|path| path.exists())
 }
 
+/// WKDownload fails rather than replaces an existing file, so a user who
+/// confirms the save panel's replacement prompt would lose the transfer.
+/// Stage beside the target instead, and move over it on completion (see
+/// `settle`). The staging paths join the same per-URL FIFO as the choices,
+/// so a download's staging file and destination are consumed as a pair.
+#[cfg(target_os = "macos")]
+static PENDING: OnceLock<Mutex<HashMap<String, VecDeque<PathBuf>>>> = OnceLock::new();
+
+#[cfg(target_os = "macos")]
+fn pending() -> &'static Mutex<HashMap<String, VecDeque<PathBuf>>> {
+    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The URL a finished transfer settles at: the user's chosen path directly,
+/// unless that path existed — then a fresh hidden sibling to stage through.
+#[cfg(target_os = "macos")]
+fn staging_destination(url: &str, destination: PathBuf) -> PathBuf {
+    if !destination.exists() {
+        return destination;
+    }
+    let name = destination
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut staged = destination.clone();
+    let mut counter = 0;
+    loop {
+        counter += 1;
+        staged.set_file_name(format!(".{name}.oardsh-{counter}.part"));
+        if !staged.exists() {
+            break;
+        }
+    }
+    let mut pending = pending().lock().unwrap_or_else(|err| err.into_inner());
+    if pending.len() >= 32 {
+        pending.clear();
+    }
+    pending
+        .entry(url.to_string())
+        .or_default()
+        .push_back(staged.clone());
+    staged
+}
+
+#[cfg(not(target_os = "macos"))]
+fn staging_destination(_url: &str, destination: PathBuf) -> PathBuf {
+    destination
+}
+
+/// Move a finished staging file over the destination it stands in for.
+#[cfg(target_os = "macos")]
+fn settle(url: &str, destination: Option<PathBuf>) -> Option<PathBuf> {
+    let destination = destination?;
+    match pending()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .get_mut(url)
+        .and_then(VecDeque::pop_front)
+    {
+        Some(temp) if std::fs::rename(&temp, &destination).is_ok() => Some(destination),
+        // The move failed — say where the archive actually is rather than
+        // claim a save that did not land.
+        Some(temp) => Some(temp),
+        None => Some(destination),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn take_pending(url: &str) -> Option<PathBuf> {
+    pending()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .get_mut(url)
+        .and_then(VecDeque::pop_front)
+}
+
 fn announce(webview: &Webview<Wry>, url: &tauri::Url, path: Option<PathBuf>, success: bool) {
     let locale = i18n::system_locale();
     // wry 0.55's webkitgtk backend tracks download failure on one flag for
@@ -116,11 +192,17 @@ fn announce(webview: &Webview<Wry>, url: &tauri::Url, path: Option<PathBuf>, suc
     // later export reading as failed.
     #[cfg(target_os = "linux")]
     let success = success || arrived(url.as_str());
-    // Prefer the path the platform reports for this finished download: with
-    // two exports of one session in flight, the head of the remembered queue
-    // may belong to the other one.
+    // Consume the remembered choice on every completion, reported path or
+    // not, so a later download of the same URL never inherits a stale one;
+    // the platform's path is only what gets displayed.
+    let remembered = take(url.as_str());
     let text = if success {
-        match path.or_else(|| take(url.as_str())) {
+        // macOS: WKDownload cannot write onto an existing file, so a
+        // replacement the user confirmed in the save panel was staged
+        // beside the target; move it into place now.
+        #[cfg(target_os = "macos")]
+        let remembered = settle(url.as_str(), remembered);
+        match path.or(remembered) {
             Some(path) => format!(
                 "{}: {}",
                 i18n::translate(locale, "download.saved"),
@@ -133,7 +215,10 @@ fn announce(webview: &Webview<Wry>, url: &tauri::Url, path: Option<PathBuf>, suc
         // that choice, not a failure worth announcing.
         return;
     } else {
-        let _ = take(url.as_str());
+        #[cfg(target_os = "macos")]
+        if let Some(temp) = take_pending(url.as_str()) {
+            let _ = std::fs::remove_file(temp);
+        }
         i18n::translate(locale, "download.failed")
     };
     let _ = webview.eval(toast_script(&text, success).as_str());
