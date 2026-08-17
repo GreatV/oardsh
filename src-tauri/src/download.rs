@@ -128,6 +128,16 @@ fn announce(webview: &Webview<Wry>, url: &tauri::Url, path: Option<PathBuf>, suc
     // later export reading as failed.
     #[cfg(target_os = "linux")]
     let success = success || arrived(url.as_str());
+    // A cancelled download never recorded a choice, and its completion must
+    // not consume the choice of a peer transfer still in flight — check it
+    // first. The mark is drained either way: a cancelled request that
+    // somehow reports success must not smother a later genuine failure.
+    let cancelled = take_cancelled(url.as_str());
+    if cancelled && !success {
+        // The user closed the save dialog; the rejection reported here is
+        // that choice, not a failure worth announcing.
+        return;
+    }
     // Consume the choice on every completion, reported path or not, so a
     // later download of the same URL never inherits a stale one; the
     // platform's path is only what gets displayed.
@@ -155,10 +165,6 @@ fn announce(webview: &Webview<Wry>, url: &tauri::Url, path: Option<PathBuf>, suc
             ),
             None => i18n::translate(locale, "download.savedDefault"),
         }
-    } else if take_cancelled(url.as_str()) {
-        // The user closed the save dialog; the rejection reported here is
-        // that choice, not a failure worth announcing.
-        return;
     } else {
         #[cfg(target_os = "macos")]
         if let Some(staged) = choice.as_ref().and_then(|choice| choice.staged.as_ref()) {
@@ -207,7 +213,9 @@ fn park_while_hidden(webview: &Webview<Wry>, text: &str, success: bool) -> bool 
     }
     let mut unseen = unseen().lock().unwrap_or_else(|err| err.into_inner());
     if unseen.len() >= 8 {
-        unseen.clear();
+        // Shed the oldest, not the batch: a ninth result arriving while the
+        // window is hidden must not erase the eight before it.
+        unseen.remove(0);
     }
     unseen.push((text.to_string(), success));
     true
