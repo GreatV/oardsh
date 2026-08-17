@@ -44,6 +44,7 @@ pub fn update_url(url: &str) {
     let Some(path) = sidecar_path() else {
         return;
     };
+    recover_backup(&path);
     let Ok(body) = fs::read_to_string(&path) else {
         return;
     };
@@ -85,6 +86,7 @@ pub fn mark_tray_hint_seen() {
 /// process whose command line is not our entry is left alone.
 pub fn recover_ours(ready: impl Fn(&str) -> bool) -> Option<(u32, PathBuf, String)> {
     let path = sidecar_path()?;
+    recover_backup(&path);
     let body = fs::read_to_string(&path).ok()?;
     let record = serde_json::from_str::<Record>(&body).ok()?;
     let entry = PathBuf::from(&record.entry);

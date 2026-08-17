@@ -94,13 +94,15 @@ fn env_ops(
                 ("no_proxy", Some(no_proxy)),
             ];
             // Node's env-proxy reads HTTP(S)_PROXY, not ALL_PROXY.
-            if inherited.http.is_empty() && inherited.https.is_empty() && !inherited.all.is_empty()
-            {
-                let url = inherited.all.clone();
-                ops.push(("HTTP_PROXY", Some(url.clone())));
-                ops.push(("HTTPS_PROXY", Some(url.clone())));
-                ops.push(("http_proxy", Some(url.clone())));
-                ops.push(("https_proxy", Some(url)));
+            if !inherited.all.is_empty() {
+                if inherited.http.is_empty() {
+                    ops.push(("HTTP_PROXY", Some(inherited.all.clone())));
+                    ops.push(("http_proxy", Some(inherited.all.clone())));
+                }
+                if inherited.https.is_empty() {
+                    ops.push(("HTTPS_PROXY", Some(inherited.all.clone())));
+                    ops.push(("https_proxy", Some(inherited.all.clone())));
+                }
             }
             ops
         }
@@ -213,7 +215,21 @@ fn config_path() -> Option<std::path::PathBuf> {
     paths::resolve_dsh_home().map(|home| std::path::PathBuf::from(home).join("oardsh.proxy.json"))
 }
 
+fn redact_proxy_url(raw: &str) -> String {
+    let Ok(mut parsed) = tauri::Url::parse(raw.trim()) else {
+        return raw.to_string();
+    };
+    if parsed.password().is_some() {
+        let _ = parsed.set_password(Some("****"));
+    }
+    parsed.to_string()
+}
+
 fn view(app: &tauri::AppHandle, config: ProxyConfig) -> ProxyView {
+    let mut config = config;
+    if !config.url.is_empty() {
+        config.url = redact_proxy_url(&config.url);
+    }
     ProxyView {
         config,
         fetch_proxy: node_supports_env_proxy(app),
@@ -252,10 +268,14 @@ fn node_supports_env_proxy(app: &tauri::AppHandle) -> bool {
     let Ok(node) = paths::resolve_node(app) else {
         return false;
     };
-    let Ok(output) = Command::new(node)
-        .args(["-p", "process.versions.node"])
-        .output()
-    else {
+    let mut probe = Command::new(node);
+    probe.args(["-p", "process.versions.node"]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        probe.creation_flags(0x0800_0000);
+    }
+    let Ok(output) = probe.output() else {
         return false;
     };
     output.status.success() && node_env_proxy_ok(&String::from_utf8_lossy(&output.stdout))
@@ -268,9 +288,18 @@ pub fn set_proxy_config(
     url: String,
     no_proxy: String,
 ) -> Result<ProxyView, String> {
+    let stored = load();
+    let submitted = url.trim();
+    if submitted.len() > 512 {
+        return Err("Proxy URL is too long".into());
+    }
     let mut config = ProxyConfig {
         mode,
-        url: url.trim().to_string(),
+        url: if !stored.url.is_empty() && submitted == redact_proxy_url(&stored.url) {
+            stored.url.clone()
+        } else {
+            submitted.to_string()
+        },
         no_proxy: validate_no_proxy(&no_proxy)?,
     };
     if config.mode == ProxyMode::Manual {
@@ -288,8 +317,8 @@ pub fn set_proxy_config(
 #[cfg(test)]
 mod tests {
     use super::{
-        env_ops, merge_no_proxy, node_env_proxy_ok, validate_no_proxy, validate_proxy_url,
-        InheritedProxy, ProxyConfig, ProxyMode, NO_PROXY_MAX,
+        env_ops, merge_no_proxy, node_env_proxy_ok, redact_proxy_url, validate_no_proxy,
+        validate_proxy_url, InheritedProxy, ProxyConfig, ProxyMode, NO_PROXY_MAX,
     };
 
     #[test]
@@ -402,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn system_leaves_http_proxy_alone_when_already_set() {
+    fn system_fills_only_the_missing_protocol_from_all_proxy() {
         let ops = env_ops(
             &ProxyConfig {
                 mode: ProxyMode::System,
@@ -415,5 +444,22 @@ mod tests {
             },
         );
         assert!(ops.iter().all(|(name, _)| *name != "HTTP_PROXY"));
+        let https = ops
+            .iter()
+            .find(|(name, _)| *name == "HTTPS_PROXY")
+            .and_then(|(_, value)| value.as_deref());
+        assert_eq!(https, Some("http://127.0.0.1:7890"));
+    }
+
+    #[test]
+    fn redacts_proxy_passwords() {
+        assert_eq!(
+            redact_proxy_url("http://user:secret@127.0.0.1:7890"),
+            "http://user:****@127.0.0.1:7890/"
+        );
+        assert_eq!(
+            redact_proxy_url("http://127.0.0.1:7890"),
+            "http://127.0.0.1:7890/"
+        );
     }
 }
