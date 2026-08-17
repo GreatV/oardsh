@@ -51,6 +51,12 @@ pub fn run() {
                 let _ = window.hide();
                 engine::note_hidden_to_tray(window.app_handle());
             }
+            // Restoring from the taskbar or title bar focuses the window
+            // without passing through reveal_main; parked download toasts
+            // must come back with the window however it was raised.
+            if let tauri::WindowEvent::Focused(true) = event {
+                download::replay_unseen(window.app_handle());
+            }
         })
         .on_menu_event(|app, event| match event.id().as_ref() {
             "restart" => engine::restart_from_menu(app),

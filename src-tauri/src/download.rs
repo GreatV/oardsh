@@ -224,9 +224,12 @@ pub fn replay_unseen(app: &tauri::AppHandle) {
     }
 }
 
-/// One idempotent toast in the corner of the dsh page; its CSS variables keep
-/// the theme, with neutral fallbacks for a page that lacks them. The path is
-/// set via textContent (never innerHTML) so its contents stay inert.
+/// Toasts queue up rather than replace each other, one element shown at a
+/// time: results parked while the window was hidden replay back to back, and
+/// a live second completion waits out the first instead of erasing it. CSS
+/// variables keep the dsh theme, with neutral fallbacks for a page that
+/// lacks them. The path rides the queue as a string and is set via
+/// textContent (never innerHTML) so its contents stay inert.
 fn toast_script(text: &str, success: bool) -> String {
     let message = serde_json::to_string(text).unwrap_or_default();
     let color = if success {
@@ -235,7 +238,7 @@ fn toast_script(text: &str, success: bool) -> String {
         "var(--dsw-alias-state-error-primary,#e34948)"
     };
     format!(
-        r#"(function(){{var t=document.getElementById('oardsh-download-toast');if(!t){{t=document.createElement('div');t.id='oardsh-download-toast';t.style.cssText='position:fixed;z-index:2147483000;right:16px;bottom:16px;max-width:420px;padding:10px 14px;border-radius:10px;font:12px/18px system-ui,sans-serif;box-shadow:0 6px 20px rgba(0,0,0,.18);background:var(--dsw-alias-bg-layer-1,#fff);border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.12));transition:opacity .4s;pointer-events:none';document.body.appendChild(t);}}clearTimeout(t._oardsh);t.style.color='{color}';t.textContent={message};t.style.opacity='1';t._oardsh=setTimeout(function(){{t.style.opacity='0';}},6000);}})()"#
+        r#"(function(){{var q=window.__oardshToasts||(window.__oardshToasts=[]);q.push({{text:{message},color:'{color}'}});if(window.__oardshPumping)return;window.__oardshPumping=true;var step=function(){{var i=q.shift();if(!i){{window.__oardshPumping=false;return;}}var t=document.getElementById('oardsh-download-toast');if(!t){{t=document.createElement('div');t.id='oardsh-download-toast';t.style.cssText='position:fixed;z-index:2147483000;right:16px;bottom:16px;max-width:420px;padding:10px 14px;border-radius:10px;font:12px/18px system-ui,sans-serif;box-shadow:0 6px 20px rgba(0,0,0,.18);background:var(--dsw-alias-bg-layer-1,#fff);border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.12));transition:opacity .4s;pointer-events:none';document.body.appendChild(t);}}clearTimeout(t._oardsh);t.style.color=i.color;t.textContent=i.text;t.style.opacity='1';t._oardsh=setTimeout(function(){{t.style.opacity='0';setTimeout(step,450);}},6000);}};step();}})()"#
     )
 }
 
@@ -370,7 +373,7 @@ mod tests {
     #[test]
     fn toast_script_embeds_the_path_as_an_escaped_literal() {
         let script = toast_script("已保存到: C:\\Users\\Vince \"q\".zip", false);
-        assert!(script.contains("textContent=\"已保存到: C:\\\\Users\\\\Vince \\\"q\\\".zip\""));
+        assert!(script.contains("text:\"已保存到: C:\\\\Users\\\\Vince \\\"q\\\".zip\""));
         assert!(script.contains("oardsh-download-toast"));
     }
 }
