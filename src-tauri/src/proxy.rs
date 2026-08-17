@@ -88,7 +88,6 @@ fn env_ops(
             .chain(std::iter::once(("NODE_USE_ENV_PROXY", None)))
             .collect(),
         ProxyMode::System => {
-            let no_proxy = merge_no_proxy(&inherited.no_proxy);
             let http = if inherited.http.is_empty() {
                 inherited.all.clone()
             } else {
@@ -99,11 +98,13 @@ fn env_ops(
             } else {
                 inherited.https.clone()
             };
-            let mut ops = vec![
-                ("NODE_USE_ENV_PROXY", Some("1".into())),
-                ("NO_PROXY", Some(no_proxy.clone())),
-                ("no_proxy", Some(no_proxy)),
-            ];
+            let mut ops = vec![("NODE_USE_ENV_PROXY", Some("1".into()))];
+            // A legitimate inherited bypass list can exceed the spawn bound.
+            // Leave the launch variables alone rather than dropping hosts.
+            if let Some(no_proxy) = merge_no_proxy(&inherited.no_proxy) {
+                ops.push(("NO_PROXY", Some(no_proxy.clone())));
+                ops.push(("no_proxy", Some(no_proxy)));
+            }
             if !http.is_empty() {
                 ops.push(("HTTP_PROXY", Some(http.clone())));
                 ops.push(("http_proxy", Some(http)));
@@ -116,7 +117,7 @@ fn env_ops(
         }
         ProxyMode::Manual => {
             let url = config.url.trim().to_string();
-            let no_proxy = merge_no_proxy(&config.no_proxy);
+            let no_proxy = merge_no_proxy(&config.no_proxy).unwrap_or_else(|| LOOPBACK.join(","));
             vec![
                 ("NODE_USE_ENV_PROXY", Some("1".into())),
                 ("HTTP_PROXY", Some(url.clone())),
@@ -175,15 +176,25 @@ fn inherited_proxy() -> InheritedProxy {
 }
 
 pub fn fingerprint(config: &ProxyConfig) -> String {
-    let mode = match config.mode {
-        ProxyMode::System => "system",
-        ProxyMode::Off => "off",
-        ProxyMode::Manual => "manual",
-    };
-    format!("{mode}|{}|{}", config.url, config.no_proxy)
+    fingerprint_with(config, &inherited_proxy())
 }
 
-fn merge_no_proxy(user: &str) -> String {
+fn fingerprint_with(config: &ProxyConfig, inherited: &InheritedProxy) -> String {
+    match config.mode {
+        // System traffic follows the launch environment, so adopt must
+        // refuse a leftover child after HTTP_PROXY / NO_PROXY change.
+        ProxyMode::System => format!(
+            "system|{}|{}|{}|{}",
+            inherited.http, inherited.https, inherited.all, inherited.no_proxy
+        ),
+        ProxyMode::Off => "off".into(),
+        ProxyMode::Manual => format!("manual|{}|{}", config.url, config.no_proxy),
+    }
+}
+
+/// Loopback plus `user`. `None` if every user host cannot be kept under
+/// `MERGED_NO_PROXY_MAX` — callers must not drop the suffix.
+fn merge_no_proxy(user: &str) -> Option<String> {
     let mut parts: Vec<String> = LOOPBACK.iter().map(|item| (*item).to_string()).collect();
     for extra in user.split(',') {
         let trimmed = extra.trim();
@@ -197,18 +208,8 @@ fn merge_no_proxy(user: &str) -> String {
             parts.push(trimmed.to_string());
         }
     }
-    let mut merged = String::new();
-    for part in parts {
-        let next_len = merged.len() + part.len() + usize::from(!merged.is_empty());
-        if next_len > MERGED_NO_PROXY_MAX {
-            break;
-        }
-        if !merged.is_empty() {
-            merged.push(',');
-        }
-        merged.push_str(&part);
-    }
-    merged
+    let merged = parts.join(",");
+    (merged.len() <= MERGED_NO_PROXY_MAX).then_some(merged)
 }
 
 fn validate_proxy_url(raw: &str) -> Result<String, String> {
@@ -360,8 +361,8 @@ fn confirm_apply(app: &tauri::AppHandle) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        env_ops, merge_no_proxy, node_env_proxy_ok, redact_proxy_url, validate_no_proxy,
-        validate_proxy_url, InheritedProxy, ProxyConfig, ProxyMode, MERGED_NO_PROXY_MAX,
+        env_ops, fingerprint_with, merge_no_proxy, node_env_proxy_ok, redact_proxy_url,
+        validate_no_proxy, validate_proxy_url, InheritedProxy, ProxyConfig, ProxyMode,
         NO_PROXY_MAX,
     };
 
@@ -379,7 +380,7 @@ mod tests {
 
     #[test]
     fn loopback_is_never_proxied() {
-        let merged = merge_no_proxy("example.com, 127.0.0.1");
+        let merged = merge_no_proxy("example.com, 127.0.0.1").unwrap();
         assert!(merged.contains("localhost"));
         assert!(merged.contains("127.0.0.1"));
         assert!(merged.contains("example.com"));
@@ -472,6 +473,12 @@ mod tests {
             .find(|(name, _)| *name == "HTTP_PROXY")
             .and_then(|(_, value)| value.as_deref());
         assert_eq!(http, Some("http://127.0.0.1:7890"));
+        let no_proxy = ops
+            .iter()
+            .find(|(name, _)| *name == "NO_PROXY")
+            .and_then(|(_, value)| value.as_deref())
+            .unwrap();
+        assert!(no_proxy.contains("localhost"));
     }
 
     #[test]
@@ -505,11 +512,71 @@ mod tests {
     }
 
     #[test]
-    fn merged_no_proxy_stays_bounded() {
-        let huge = format!("localhost,{}", "x.example,".repeat(800));
-        let merged = merge_no_proxy(&huge);
-        assert!(merged.contains("localhost"));
-        assert!(merged.len() <= MERGED_NO_PROXY_MAX);
+    fn oversized_inherited_no_proxy_is_not_rewritten() {
+        let huge = (0..400)
+            .map(|i| format!("host{i}.internal.example"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(merge_no_proxy(&huge).is_none());
+        let ops = env_ops(
+            &ProxyConfig {
+                mode: ProxyMode::System,
+                ..ProxyConfig::default()
+            },
+            &InheritedProxy {
+                no_proxy: huge,
+                ..InheritedProxy::default()
+            },
+        );
+        assert!(ops
+            .iter()
+            .all(|(name, _)| *name != "NO_PROXY" && *name != "no_proxy"));
+        assert!(ops
+            .iter()
+            .any(|(name, value)| *name == "NODE_USE_ENV_PROXY" && value.as_deref() == Some("1")));
+    }
+
+    #[test]
+    fn fingerprint_includes_inherited_system_proxy() {
+        let config = ProxyConfig {
+            mode: ProxyMode::System,
+            ..ProxyConfig::default()
+        };
+        let first = fingerprint_with(
+            &config,
+            &InheritedProxy {
+                http: "http://proxy-a:8080".into(),
+                ..InheritedProxy::default()
+            },
+        );
+        let second = fingerprint_with(
+            &config,
+            &InheritedProxy {
+                http: "http://proxy-b:8080".into(),
+                ..InheritedProxy::default()
+            },
+        );
+        assert_ne!(first, second);
+        let off = ProxyConfig {
+            mode: ProxyMode::Off,
+            ..ProxyConfig::default()
+        };
+        assert_eq!(
+            fingerprint_with(
+                &off,
+                &InheritedProxy {
+                    http: "http://proxy-a:8080".into(),
+                    ..InheritedProxy::default()
+                }
+            ),
+            fingerprint_with(
+                &off,
+                &InheritedProxy {
+                    http: "http://proxy-b:8080".into(),
+                    ..InheritedProxy::default()
+                }
+            )
+        );
     }
 
     #[test]

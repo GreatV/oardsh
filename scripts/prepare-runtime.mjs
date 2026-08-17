@@ -17,15 +17,35 @@ if (!spec) {
   throw new Error("package-lock.json does not pin @deepseek-ai/dsh; run npm install");
 }
 
+function lockScopedName(path) {
+  const match = path.match(/(?:^|\/)node_modules\/(@deepseek-ai\/[^/]+)$/);
+  return match ? match[1] : null;
+}
+
+function deepseekPinsFromLock(lockfile) {
+  const chosen = new Map();
+  for (const [path, pkg] of Object.entries(lockfile.packages ?? {})) {
+    if (!pkg.version) continue;
+    const name = lockScopedName(path);
+    if (!name) continue;
+    const depth = path.split("node_modules/").length - 1;
+    const prev = chosen.get(name);
+    if (!prev || depth < prev.depth) {
+      chosen.set(name, { version: pkg.version, depth });
+    } else if (depth === prev.depth && pkg.version !== prev.version) {
+      throw new Error(
+        `package-lock.json pins ${name} to both ${prev.version} and ${pkg.version}`,
+      );
+    }
+  }
+  return Object.fromEntries([...chosen].map(([name, { version }]) => [name, version]));
+}
+
 // dsh's own package.json uses ^ ranges. A sibling @deepseek-ai/* rc can
 // publish before its peers, and a lockless install then asks for a version
-// that is not on the registry. Force every scoped package to the root lock.
-const deepseekPins = {};
-for (const [path, pkg] of Object.entries(lock.packages ?? {})) {
-  if (!pkg.version || !path.startsWith("node_modules/@deepseek-ai/")) continue;
-  if (path.slice("node_modules/@deepseek-ai/".length).includes("/")) continue;
-  deepseekPins[path.slice("node_modules/".length)] = pkg.version;
-}
+// that is not on the registry. Force every scoped package the lock names —
+// including nested copies that never got hoisted — to that locked version.
+const deepseekPins = deepseekPinsFromLock(lock);
 
 mkdirSync(runtimeDir, { recursive: true });
 const nodeName = process.platform === "win32" ? "node.exe" : "node";
