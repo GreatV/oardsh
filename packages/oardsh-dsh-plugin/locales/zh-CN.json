@@ -35,7 +35,7 @@
   "statsPlacement.ring": "上下文圆环",
   "statsPlacement.dsh": "dsh 默认",
   "proxy.title": "网络代理",
-  "proxy.help": "由 oardsh 提供：让 dsh 的 API 与工具流量走代理。应用后会重启服务。本机回环地址不会走代理。",
+  "proxy.help": "由 oardsh 提供：让 dsh 的 API 与工具流量走代理。应用后会重启服务。本机回环地址不会走代理。手动模式需要 Node 22.21 或打包版 oardsh。",
   "proxy.mode.off": "关闭",
   "proxy.mode.system": "系统",
   "proxy.mode.manual": "手动",

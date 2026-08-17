@@ -7,6 +7,9 @@ use crate::paths;
 use crate::sidecar;
 
 const LOOPBACK: &[&str] = &["localhost", "127.0.0.1", "::1", "[::1]"];
+/// Well under the Windows environment-block limit, so a huge paste cannot
+/// make the next spawn fail and lock the user out of Settings.
+const NO_PROXY_MAX: usize = 2048;
 const PROXY_VARS: &[&str] = &[
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -102,9 +105,15 @@ fn apply_ops(command: &mut Command, ops: &[(&str, Option<String>)]) {
 }
 
 fn inherited_no_proxy() -> String {
-    env::var("NO_PROXY")
-        .or_else(|_| env::var("no_proxy"))
-        .unwrap_or_default()
+    let upper = env::var("NO_PROXY").unwrap_or_default();
+    let lower = env::var("no_proxy").unwrap_or_default();
+    if upper.is_empty() {
+        return lower;
+    }
+    if lower.is_empty() {
+        return upper;
+    }
+    format!("{upper},{lower}")
 }
 
 fn merge_no_proxy(user: &str) -> String {
@@ -148,16 +157,8 @@ fn save(config: &ProxyConfig) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
     let body = serde_json::to_vec(config).map_err(|err| err.to_string())?;
-    sidecar::persist_atomic(&path, &body);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-    if !path.is_file() {
-        return Err("Failed to save proxy settings".into());
-    }
-    Ok(())
+    sidecar::persist_atomic(&path, &body)
+        .map_err(|err| format!("Failed to save proxy settings: {err}"))
 }
 
 fn config_path() -> Option<std::path::PathBuf> {
@@ -169,8 +170,45 @@ pub fn proxy_config() -> ProxyConfig {
     load()
 }
 
+fn validate_no_proxy(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.len() > NO_PROXY_MAX {
+        return Err("The no-proxy list is too long".into());
+    }
+    Ok(trimmed.to_string())
+}
+
+/// `NODE_USE_ENV_PROXY` landed in 22.21 and 24.0. Node 23 never got it.
+fn node_env_proxy_ok(version: &str) -> bool {
+    let trimmed = version.trim().trim_start_matches('v');
+    let mut parts = trimmed.split(|c: char| !c.is_ascii_digit());
+    let major = parts
+        .next()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let minor = parts
+        .next()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    major >= 24 || (major == 22 && minor >= 21)
+}
+
+fn node_supports_env_proxy(app: &tauri::AppHandle) -> bool {
+    let Ok(node) = paths::resolve_node(app) else {
+        return false;
+    };
+    let Ok(output) = Command::new(node)
+        .args(["-p", "process.versions.node"])
+        .output()
+    else {
+        return false;
+    };
+    output.status.success() && node_env_proxy_ok(&String::from_utf8_lossy(&output.stdout))
+}
+
 #[tauri::command]
 pub fn set_proxy_config(
+    app: tauri::AppHandle,
     mode: ProxyMode,
     url: String,
     no_proxy: String,
@@ -178,10 +216,15 @@ pub fn set_proxy_config(
     let mut config = ProxyConfig {
         mode,
         url: url.trim().to_string(),
-        no_proxy: no_proxy.trim().to_string(),
+        no_proxy: validate_no_proxy(&no_proxy)?,
     };
     if config.mode == ProxyMode::Manual {
         config.url = validate_proxy_url(&config.url)?;
+        if !node_supports_env_proxy(&app) {
+            return Err(
+                "Manual proxy needs Node 22.21 or later, or a packaged oardsh runtime.".into(),
+            );
+        }
     }
     save(&config)?;
     Ok(config)
@@ -189,7 +232,10 @@ pub fn set_proxy_config(
 
 #[cfg(test)]
 mod tests {
-    use super::{env_ops, merge_no_proxy, validate_proxy_url, ProxyConfig, ProxyMode};
+    use super::{
+        env_ops, merge_no_proxy, node_env_proxy_ok, validate_no_proxy, validate_proxy_url,
+        ProxyConfig, ProxyMode, NO_PROXY_MAX,
+    };
 
     #[test]
     fn rejects_non_http_proxy_urls() {
@@ -210,6 +256,23 @@ mod tests {
         assert!(merged.contains("127.0.0.1"));
         assert!(merged.contains("example.com"));
         assert_eq!(merged.matches("127.0.0.1").count(), 1);
+    }
+
+    #[test]
+    fn rejects_an_oversized_no_proxy_list() {
+        assert!(validate_no_proxy("corp.local").is_ok());
+        assert!(validate_no_proxy(&"a".repeat(NO_PROXY_MAX + 1)).is_err());
+    }
+
+    #[test]
+    fn env_proxy_needs_node_22_21_or_24() {
+        assert!(!node_env_proxy_ok("18.20.8"));
+        assert!(!node_env_proxy_ok("20.19.0"));
+        assert!(!node_env_proxy_ok("v22.20.2"));
+        assert!(!node_env_proxy_ok("23.11.0"));
+        assert!(node_env_proxy_ok("v22.21.0"));
+        assert!(node_env_proxy_ok("24.0.0"));
+        assert!(node_env_proxy_ok("24.19.0"));
     }
 
     #[test]

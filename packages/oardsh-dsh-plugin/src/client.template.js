@@ -521,7 +521,7 @@ window.__ModuleLoader__.load({
           setSaved(config);
         }).catch((reason) => setError(String(reason).replace(/^Error:\s*/, "")));
       }, [native]);
-      const dirty = !saved || saved.mode !== mode || (saved.url || "") !== url || (saved.noProxy || "") !== noProxy;
+      const dirty = Boolean(saved) && (saved.mode !== mode || (saved.url || "") !== url || (saved.noProxy || "") !== noProxy);
       const apply = async () => {
         setBusy(true);
         setError("");
@@ -560,7 +560,7 @@ window.__ModuleLoader__.load({
                 onChange: (event) => setNoProxy(event.target.value),
               })),
             h("div", { className: "oardsh-general-actions" },
-              h("button", { type: "button", className: "oardsh-button", disabled: busy || !dirty, onClick: apply },
+              h("button", { type: "button", className: "oardsh-button", disabled: busy || !saved || !dirty, onClick: apply },
                 busy ? t("proxy.applying") : t("proxy.apply"))),
             error && h("div", { className: "oardsh-error" }, error))));
     }

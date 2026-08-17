@@ -36,7 +36,7 @@ pub fn write(pid: u32, entry: &Path, url: Option<&str>) {
         url: url.map(str::to_string),
     };
     if let Ok(body) = serde_json::to_string(&record) {
-        persist_atomic(&path, body.as_bytes());
+        let _ = persist_atomic(&path, body.as_bytes());
     }
 }
 
@@ -52,7 +52,7 @@ pub fn update_url(url: &str) {
     };
     record.url = Some(url.to_string());
     if let Ok(next) = serde_json::to_string(&record) {
-        persist_atomic(&path, next.as_bytes());
+        let _ = persist_atomic(&path, next.as_bytes());
     }
 }
 
@@ -226,18 +226,42 @@ fn sidecar_path() -> Option<PathBuf> {
 
 /// Write via a sibling temp file, then rename. `fs::write` truncates first, so
 /// a crash mid-update would leave an unreadable record and a leaked dsh.
-pub(crate) fn persist_atomic(path: &Path, body: &[u8]) {
+pub(crate) fn persist_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
-    if fs::write(&tmp, body).is_err() {
-        return;
-    }
+    write_private(&tmp, body)?;
     if fs::rename(&tmp, path).is_ok() {
-        return;
+        return Ok(());
     }
     // Windows cannot rename over an existing file.
     let _ = fs::remove_file(path);
-    if fs::rename(&tmp, path).is_err() {
-        let _ = fs::remove_file(&tmp);
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = fs::remove_file(&tmp);
+            Err(err)
+        }
+    }
+}
+
+fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(body)?;
+        file.sync_all()?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, body)
     }
 }
 
@@ -313,8 +337,8 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("oardsh.sidecar.json");
-        persist_atomic(&path, br#"{"pid":1,"entry":"/old.js"}"#);
-        persist_atomic(&path, br#"{"pid":2,"entry":"/new.js"}"#);
+        persist_atomic(&path, br#"{"pid":1,"entry":"/old.js"}"#).unwrap();
+        persist_atomic(&path, br#"{"pid":2,"entry":"/new.js"}"#).unwrap();
         let body = fs::read_to_string(&path).unwrap();
         let parsed: Record = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed.pid, 2);
