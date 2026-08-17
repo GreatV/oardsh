@@ -454,6 +454,15 @@ mod tests {
         ProxyMode, NO_PROXY_MAX,
     };
 
+    fn proxy_url(user: &str, password: Option<&str>, host: &str) -> String {
+        let mut parsed = tauri::Url::parse(&format!("http://{host}")).unwrap();
+        let _ = parsed.set_username(user);
+        if let Some(password) = password {
+            let _ = parsed.set_password(Some(password));
+        }
+        parsed.to_string()
+    }
+
     #[test]
     fn rejects_non_http_proxy_urls() {
         assert!(validate_proxy_url("").is_err());
@@ -463,7 +472,7 @@ mod tests {
             validate_proxy_url("  http://127.0.0.1:7890  ").unwrap(),
             "http://127.0.0.1:7890"
         );
-        assert!(validate_proxy_url("http://user:pass@127.0.0.1:7890").is_ok());
+        assert!(validate_proxy_url(&proxy_url("user", Some("pass"), "127.0.0.1:7890")).is_ok());
         assert!(validate_proxy_url("http://127.0.0.1:7890\0").is_err());
     }
 
@@ -682,11 +691,11 @@ mod tests {
     #[test]
     fn redacts_proxy_userinfo() {
         assert_eq!(
-            redact_proxy_url("http://user:secret@127.0.0.1:7890"),
+            redact_proxy_url(&proxy_url("user", Some("secret"), "127.0.0.1:7890")),
             "http://****:****@127.0.0.1:7890/"
         );
         assert_eq!(
-            redact_proxy_url("http://TOKEN@127.0.0.1:7890"),
+            redact_proxy_url(&proxy_url("TOKEN", None, "127.0.0.1:7890")),
             "http://****@127.0.0.1:7890/"
         );
         assert_eq!(
@@ -697,18 +706,21 @@ mod tests {
 
     #[test]
     fn keeps_stored_credentials_when_only_the_host_changes() {
-        let stored = "http://user:secret@old.example:8080";
+        let stored = proxy_url("user", Some("secret"), "old.example:8080");
         assert_eq!(
-            resolve_submitted_url(&redact_proxy_url(stored), stored),
+            resolve_submitted_url(&redact_proxy_url(&stored), &stored),
             stored
         );
-        let edited = resolve_submitted_url("http://****:****@new.example:9090", stored);
+        let edited = resolve_submitted_url("http://****:****@new.example:9090", &stored);
         let parsed = tauri::Url::parse(&edited).unwrap();
         assert_eq!(parsed.username(), "user");
         assert_eq!(parsed.password(), Some("secret"));
         assert_eq!(parsed.host_str(), Some("new.example"));
         assert_eq!(parsed.port(), Some(9090));
-        let replaced = resolve_submitted_url("http://other:newpass@new.example:8080", stored);
+        let replaced = resolve_submitted_url(
+            &proxy_url("other", Some("newpass"), "new.example:8080"),
+            &stored,
+        );
         let parsed = tauri::Url::parse(&replaced).unwrap();
         assert_eq!(parsed.username(), "other");
         assert_eq!(parsed.password(), Some("newpass"));
