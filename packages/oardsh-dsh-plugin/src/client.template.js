@@ -11,6 +11,25 @@ window.__ModuleLoader__.load({
     /// surface oardsh injects, so none of them reads as stock dsh.
     const MARK = "__OARDSH_MARK__";
     const NS = "oardsh.desktop";
+    /// dsh's markup is not a public API and the preview ships breaking changes,
+    /// so every lookup into it is a contract that can lapse. Losing a surface is
+    /// the right failure; losing it silently is not, so name the one that broke
+    /// and the dsh it was written against.
+    const DSH_VERSION = "__OARDSH_DSH_VERSION__";
+    const lapsed = new Set();
+    const contract = (id, value) => {
+      const held = value !== null && value !== undefined && value !== false;
+      if (!held && !lapsed.has(id)) {
+        lapsed.add(id);
+        console.warn(
+          `[oardsh] dsh markup contract "${id}" no longer matches. Built against dsh ${DSH_VERSION}; ` +
+            "the desktop extras on that surface stay off until it is updated.",
+        );
+      }
+      return value;
+    };
+    // Diagnostics for a bug report: what lapsed, and what it was built against.
+    window.__OARDSH__ = { dsh: DSH_VERSION, lapsed: () => [...lapsed] };
     const RANGES = [7, 30];
     const SERIES_SLOTS = 8;
     const invoke = (command, args = {}) => {
@@ -68,7 +87,8 @@ window.__ModuleLoader__.load({
       .oardsh-general-row{display:flex;align-items:center;gap:10px;padding:16px 0;border-bottom:1px solid var(--dsw-alias-border-l2)}.oardsh-general-row .oardsh-mark{color:var(--dsw-alias-label-tertiary)}.oardsh-general-text{flex:1;min-width:0;padding-right:24px;display:flex;flex-direction:column;gap:2px}.oardsh-general-title{color:var(--dsw-alias-label-primary);font-size:14px;line-height:22px}.oardsh-general-help{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
       .oardsh-ctx-brand{display:flex;align-items:center;gap:5px;color:var(--dsw-alias-label-caption);font-size:11px;line-height:16px;margin-bottom:2px}.oardsh-ctx-brand .oardsh-mark{width:11px;height:11px}
       .oardsh-ctx-share{color:var(--dsw-alias-label-tertiary);font-weight:400}
-      .oardsh-ctx-extra{margin:8px 0 0;padding-top:8px;border-top:1px solid var(--dsw-alias-border-l2)}.oardsh-ctx-rows{margin:0}.oardsh-ctx-rows>div{display:flex;justify-content:space-between;align-items:baseline;gap:12px;padding:2px 0}.oardsh-ctx-rows dt{color:var(--dsw-alias-label-secondary);white-space:nowrap}.oardsh-ctx-rows dt:empty{display:none}.oardsh-ctx-rows dd{margin:0;color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums;text-align:right}.oardsh-ctx-rows dd[data-wide]{color:var(--dsw-alias-label-secondary);flex:1;text-align:left}
+      .oardsh-ctx-swatch{background:var(--meter-tint,var(--dsw-alias-label-tertiary));vertical-align:baseline;border-radius:2px;width:8px;height:8px;margin-right:6px;display:inline-block}
+      .oardsh-ctx-extra{margin:8px 0 0;padding-top:8px;border-top:1px solid var(--dsw-alias-border-l2)}.oardsh-ctx-rows{margin:0}.oardsh-ctx-rows>div{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:2px 0}.oardsh-ctx-rows dt{color:var(--dsw-alias-label-secondary);white-space:nowrap;flex:none}.oardsh-ctx-rows dt:empty{display:none}.oardsh-ctx-rows dd{margin:0;color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums;text-align:right}.oardsh-ctx-rows dd[data-wide]{color:var(--dsw-alias-label-primary);flex:1;text-align:left}
       [data-oardsh-stats-hidden]{display:none!important}
       .oardsh-tip{position:fixed;z-index:2147483000;transform:translate(-50%,-100%);pointer-events:none;min-width:150px;max-width:260px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-specific-menu,var(--dsw-alias-bg-layer-1));box-shadow:var(--dsw-shadow-lv3,0 6px 20px rgba(0,0,0,.18));border-radius:10px;padding:9px 11px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}
       .oardsh-tip-title{color:var(--dsw-alias-label-primary);font-weight:500;margin-bottom:4px}.oardsh-tip-rows{margin:0}.oardsh-tip-rows>div{display:flex;justify-content:space-between;gap:14px}.oardsh-tip-rows dt{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.oardsh-tip-rows dd{margin:0;color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums;flex:none}
@@ -116,6 +136,22 @@ window.__ModuleLoader__.load({
     const share = (value, total) => `${Math.round((value / total) * 1000) / 10}%`;
 
     /**
+     * dsh joins its stats into groups ("LLM 35m38s · 工具调用 20m38s") that the
+     * panel has to show as the term/reading pairs every other row uses. Split at
+     * the first digit-leading word; a reading-first stat ("2 轮", "97 tok/s") has
+     * no term, so its trailing unit becomes one.
+     */
+    const splitStat = (text) => {
+      const words = String(text).trim().split(/\s+/).filter(Boolean);
+      const at = words.findIndex((word) => /^[\d.]/.test(word));
+      if (at < 0) return { label: words.join(" "), value: "" };
+      if (at > 0) return { label: words.slice(0, at).join(" "), value: words.slice(at).join(" ") };
+      const unit = words.slice(1).join(" ");
+      return unit ? { label: unit, value: words[0] } : { label: "", value: words[0] };
+    };
+    const statRows = (group) => group.split("·").map((item) => splitStat(item)).filter((row) => row.label || row.value);
+
+    /**
      * Where the session stats belong: the context panel (default) or dsh's own
      * line under the composer. Kept out of React state because the DOM effects
      * read it too; the durable copy lives in dsh's settings document.
@@ -154,11 +190,17 @@ window.__ModuleLoader__.load({
       if (preferences.statsInPanel) strip.dataset.oardshStatsHidden = "";
       else delete strip.dataset.oardshStatsHidden;
     };
-    /** The ring: the only dialog trigger drawn as a 14px two-circle gauge. */
+    /**
+     * The ring: the only dialog trigger drawn as a 14px two-circle gauge. The
+     * arcs painted below are circles too and they outlive the panel, so count
+     * dsh's own pair only — otherwise the ring stops matching itself after the
+     * first hover and never opens again.
+     */
     const isContextRing = (element) => {
       if (!element || element.getAttribute("aria-haspopup") !== "dialog") return false;
       const svg = element.querySelector('svg[viewBox="0 0 14 14"]');
-      return Boolean(svg) && svg.querySelectorAll("circle").length === 2;
+      if (!svg) return false;
+      return contract("context.ring", svg.querySelectorAll("circle:not([data-oardsh-arc])").length === 2);
     };
     const ringRoot = (button) => {
       let node = button;
@@ -168,14 +210,109 @@ window.__ModuleLoader__.load({
       }
       return button.parentElement;
     };
+    const STAT_TINTS = ["#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#e34948"];
+    /** The stacked bar: children are the colorful used-context segments. */
+    const meterBar = (panel) => {
+      for (const el of panel.querySelectorAll("div")) {
+        const kids = [...el.children];
+        if (kids.length && kids.every((kid) => kid.tagName === "DIV" && /%$/.test(kid.style.width || ""))) return el;
+      }
+      return null;
+    };
+    /** Paint the 14px ring with the same tints as the bar, not the gray fill. */
+    function paintColorfulRing(root, panel) {
+      const svg = root.querySelector('button[aria-haspopup="dialog"] svg[viewBox="0 0 14 14"]');
+      if (!svg) return;
+      const native = [...svg.querySelectorAll("circle:not([data-oardsh-arc])")];
+      const fill = native[1];
+      const bar = meterBar(panel);
+      const segs = bar ? [...bar.children] : [];
+      const signature = segs.map((seg) => `${seg.style.width}:${getComputedStyle(seg).backgroundColor}`).join("|");
+      if (svg.dataset.oardshRing === signature) return;
+      svg.dataset.oardshRing = signature;
+      svg.querySelectorAll("[data-oardsh-arc]").forEach((node) => node.remove());
+      if (!fill) return;
+      if (segs.length === 0) {
+        fill.style.removeProperty("display");
+        return;
+      }
+      fill.style.display = "none";
+      const radius = Number(fill.getAttribute("r") || 5.5);
+      const ring = 2 * Math.PI * radius;
+      let offset = 0;
+      for (const seg of segs) {
+        const pct = parseFloat(seg.style.width);
+        if (!Number.isFinite(pct) || pct <= 0) continue;
+        const length = ring * pct / 100;
+        const drawn = Math.max(length - 0.8, 0);
+        const arc = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+        arc.dataset.oardshArc = "";
+        arc.setAttribute("cx", fill.getAttribute("cx") || "7");
+        arc.setAttribute("cy", fill.getAttribute("cy") || "7");
+        arc.setAttribute("r", String(radius));
+        arc.setAttribute("fill", "none");
+        arc.setAttribute("stroke", getComputedStyle(seg).backgroundColor);
+        arc.setAttribute("stroke-width", getComputedStyle(fill).strokeWidth || "2");
+        arc.setAttribute("stroke-dasharray", `${drawn} ${Math.max(ring - drawn, 0)}`);
+        arc.setAttribute("stroke-dashoffset", String(-offset));
+        arc.setAttribute("transform", fill.getAttribute("transform") || "rotate(-90 7 7)");
+        svg.appendChild(arc);
+        offset += length;
+      }
+    }
+    /** Free remainder sits in dsh's own colorful list, not a second grey block. */
+    function ensureFreeRow(panel, t, used, capacity) {
+      const dl = panel.querySelector("dl:not(.oardsh-ctx-rows)");
+      if (!dl || used === null || capacity === null || capacity <= used) {
+        panel.querySelector("[data-oardsh-free]")?.remove();
+        return;
+      }
+      const sample = [...dl.children].find((row) => !row.hasAttribute("data-oardsh-free"));
+      let row = dl.querySelector("[data-oardsh-free]");
+      if (!row) {
+        row = sample ? sample.cloneNode(true) : document.createElement("div");
+        row.dataset.oardshFree = "";
+        dl.appendChild(row);
+      }
+      const bar = meterBar(panel);
+      const tint = bar ? getComputedStyle(bar).backgroundColor : "var(--dsw-alias-interactive-bg-hover)";
+      if (row.style.getPropertyValue("--meter-tint") !== tint) row.style.setProperty("--meter-tint", tint);
+      for (const node of row.querySelectorAll("[class]")) {
+        const next = node.className.split(/\s+/).filter((name) => !/color(System|Tools|Messages)/i.test(name)).join(" ");
+        if (node.className !== next) node.className = next;
+      }
+      const dt = row.querySelector("dt") || row.appendChild(document.createElement("dt"));
+      const dd = row.querySelector("dd") || row.appendChild(document.createElement("dd"));
+      let swatch = dt.querySelector("span");
+      if (!swatch) {
+        swatch = document.createElement("span");
+        swatch.setAttribute("aria-hidden", "true");
+        dt.prepend(swatch);
+      }
+      if (!swatch.className.includes("oardsh-ctx-swatch")) swatch.className = `${swatch.className} oardsh-ctx-swatch`.trim();
+      if (swatch.style.background !== tint) swatch.style.background = tint;
+      const label = t("context.free");
+      const labelNode = [...dt.childNodes].find((node) => node.nodeType === Node.TEXT_NODE);
+      if (labelNode) {
+        if (labelNode.nodeValue !== label) labelNode.nodeValue = label;
+      } else {
+        dt.appendChild(document.createTextNode(label));
+      }
+      dd.querySelector("[data-oardsh-share]")?.remove();
+      const next = `~${formatTokens(capacity - used)} \u00b7 ${share(capacity - used, capacity)}`;
+      if (dd.textContent !== next) dd.textContent = next;
+    }
     /**
      * Write the extras into an open panel, comparing before every write: the
      * caller re-runs this from a MutationObserver on the same subtree.
      */
     function decorateContextPanel(root, t) {
+      // Not a contract: the panel is absent for the frame between the click and
+      // dsh's render, and the observer calls back the moment it lands.
       const panel = root.querySelector('[role="dialog"]');
       if (!panel) return;
-      const bucketRows = [...panel.querySelectorAll("dl:not(.oardsh-ctx-rows) > div")];
+      const bucketRows = [...panel.querySelectorAll("dl:not(.oardsh-ctx-rows) > div")].filter((row) => !row.hasAttribute("data-oardsh-free"));
+      contract("context.buckets", bucketRows.length > 0);
       const buckets = bucketRows.map((row) => {
         const cell = row.querySelector("dd");
         // Read the original text node, never our own appended share.
@@ -197,20 +334,21 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const lines = [];
-      // The header carries "~used / window"; the remainder is what it does not say.
+      let used = null;
+      let capacity = null;
       for (const node of panel.querySelectorAll("span")) {
         const match = /^~?([\d.]+[KM]?)\s*\/\s*([\d.]+[KM]?)$/.exec(node.textContent?.trim() || "");
         if (!match) continue;
-        const used = parseTokens(match[1]);
-        const capacity = parseTokens(match[2]);
-        if (used === null || capacity === null || capacity <= used) break;
-        lines.push([t("context.free"), `~${formatTokens(capacity - used)} \u00b7 ${share(capacity - used, capacity)}`]);
+        used = parseTokens(match[1]);
+        capacity = parseTokens(match[2]);
         break;
       }
+      contract("context.figures", used !== null && capacity !== null);
+      ensureFreeRow(panel, t, used, capacity);
+      contract("context.bar", meterBar(panel));
+      paintColorfulRing(root, panel);
 
-      for (const group of mirroredStats()) lines.push(["", group]);
-
+      const lines = mirroredStats();
       let extra = panel.querySelector("[data-oardsh-context-extra]");
       if (lines.length === 0) {
         extra?.remove();
@@ -236,16 +374,29 @@ window.__ModuleLoader__.load({
       const rows = document.createElement("dl");
       rows.className = "oardsh-ctx-rows";
       extra.append(rows);
-      for (const [label, value] of lines) {
-        const row = document.createElement("div");
-        const term = document.createElement("dt");
-        term.textContent = label;
-        const detail = document.createElement("dd");
-        detail.textContent = value;
-        if (label === "") detail.dataset.wide = "";
-        row.append(term, detail);
-        rows.append(row);
-      }
+      // One row per stat, tinted by the group it came from, so the readings sit
+      // in the same right-hand column as dsh's own bucket rows.
+      lines.forEach((group, index) => {
+        for (const { label, value } of statRows(group)) {
+          const row = document.createElement("div");
+          row.style.setProperty("--meter-tint", STAT_TINTS[index % STAT_TINTS.length]);
+          const term = document.createElement("dt");
+          const detail = document.createElement("dd");
+          if (value) {
+            const swatch = document.createElement("span");
+            swatch.className = "oardsh-ctx-swatch";
+            swatch.setAttribute("aria-hidden", "true");
+            term.append(swatch, document.createTextNode(label));
+            detail.textContent = value;
+          } else {
+            // Nothing numeric to right-align: keep the stat on one full line.
+            detail.dataset.wide = "";
+            detail.textContent = label;
+          }
+          row.append(term, detail);
+          rows.append(row);
+        }
+      });
     }
 
     function Heatmap({ days, t, onTip }) {

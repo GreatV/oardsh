@@ -1,43 +1,58 @@
 mod engine;
 mod i18n;
 mod paths;
+mod ready;
+mod sidecar;
 mod usage;
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, RunEvent};
 use tauri_plugin_opener::OpenerExt;
+use tauri_plugin_window_state::StateFlags;
 
 use engine::Engine;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            engine::reveal_main(app);
+        }))
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_window_state::Builder::default().build())
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(StateFlags::all().difference(StateFlags::VISIBLE))
+                .build(),
+        )
         .plugin(tauri_plugin_notification::init())
         .manage(Engine::new())
         .invoke_handler(tauri::generate_handler![
             engine::dsh_status,
             engine::native_web_event,
+            engine::restart_dsh,
             usage::token_usage,
         ])
         .setup(|app| {
             let menu = build_menu(app.handle())?;
             app.set_menu(menu)?;
+            build_tray(app.handle())?;
             engine::remember_boot_url(app.handle());
             engine::boot_dsh(app.handle());
             Ok(())
         })
-        .on_window_event(|window, event| {
-            // Otherwise the dsh process outlives the window with its port bound.
-            // The window is already going away, so do not navigate it.
-            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
-                let app = window.app_handle();
-                app.state::<Engine>().stop(app, false);
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                api.prevent_close();
+                let _ = window.hide();
+                engine::note_hidden_to_tray(window.app_handle());
             }
+            tauri::WindowEvent::Focused(true) => engine::clear_attention(window.app_handle()),
+            _ => {}
         })
         .on_menu_event(|app, event| match event.id().as_ref() {
             "restart" => engine::restart_from_menu(app),
+            "quit" => engine::quit_app(app),
             "reload" => engine::reload_main(app),
             "docs" => {
                 let _ = app.opener().open_url(
@@ -61,11 +76,87 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app, event| {
-            if matches!(event, RunEvent::Exit | RunEvent::ExitRequested { .. }) {
+        .run(|app, event| match event {
+            RunEvent::ExitRequested { api, code, .. } => {
+                // None: the last window was "closed". We hid it to the tray.
+                if code.is_none() {
+                    api.prevent_exit();
+                    return;
+                }
                 app.state::<Engine>().stop(app, false);
             }
+            RunEvent::Exit => {
+                app.state::<Engine>().stop(app, false);
+            }
+            #[cfg(target_os = "macos")]
+            RunEvent::Reopen { .. } => engine::reveal_main(app),
+            _ => {}
         });
+}
+
+fn build_tray(app: &AppHandle) -> tauri::Result<()> {
+    let locale = i18n::system_locale();
+    let show = MenuItem::with_id(
+        app,
+        "tray-show",
+        i18n::translate(locale, "tray.show"),
+        true,
+        None::<&str>,
+    )?;
+    let restart = MenuItem::with_id(
+        app,
+        "tray-restart",
+        i18n::translate(locale, "tray.restart"),
+        true,
+        None::<&str>,
+    )?;
+    let quit = MenuItem::with_id(
+        app,
+        "tray-quit",
+        i18n::translate(locale, "tray.quit"),
+        true,
+        None::<&str>,
+    )?;
+    let menu = Menu::with_items(app, &[&show, &restart, &quit])?;
+    let icon = tray_icon();
+    TrayIconBuilder::with_id("main")
+        .icon(icon)
+        .menu(&menu)
+        .tooltip("oardsh")
+        .icon_as_template(cfg!(target_os = "macos"))
+        .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                engine::reveal_main(tray.app_handle());
+            }
+        })
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "tray-show" => engine::reveal_main(app),
+            "tray-restart" => engine::restart_from_menu(app),
+            "tray-quit" => engine::quit_app(app),
+            _ => {}
+        })
+        .build(app)?;
+    Ok(())
+}
+
+/// The app icon's drawing with its plate taken away, so the menu bar paints it
+/// in its own ink instead of showing a white tile with a speck on it.
+fn tray_icon() -> tauri::image::Image<'static> {
+    // macOS paints template images from alpha, so the glyph ships as a mask.
+    // Everywhere else the taskbar shows the icon as-is, over a background that
+    // is light in one theme and dark in the other, so it keeps its plate.
+    let bytes: &'static [u8] = if cfg!(target_os = "macos") {
+        include_bytes!("../icons/tray-mac.png")
+    } else {
+        include_bytes!("../icons/tray.png")
+    };
+    tauri::image::Image::from_bytes(bytes).expect("the tray glyph is a valid PNG")
 }
 
 fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
@@ -77,39 +168,62 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         ..Default::default()
     };
 
+    let locale = i18n::system_locale();
     let restart = MenuItem::with_id(
         app,
         "restart",
-        "Restart Server",
+        i18n::translate(locale, "menu.restart"),
         true,
         Some("CmdOrCtrl+Shift+R"),
     )?;
-    let reload = MenuItem::with_id(app, "reload", "Reload", true, Some("CmdOrCtrl+R"))?;
+    // Custom quit so Cmd+Q / the menu item stop dsh. The predefined Quit
+    // item is treated as "user closed the last window" and would be swallowed
+    // by the hide-to-tray ExitRequested handler.
+    let quit = MenuItem::with_id(
+        app,
+        "quit",
+        i18n::translate(locale, "menu.quit"),
+        true,
+        Some("CmdOrCtrl+Q"),
+    )?;
+    let reload = MenuItem::with_id(
+        app,
+        "reload",
+        i18n::translate(locale, "menu.reload"),
+        true,
+        Some("CmdOrCtrl+R"),
+    )?;
     let docs = MenuItem::with_id(
         app,
         "docs",
-        "DeepSeek Harness on GitHub",
+        i18n::translate(locale, "menu.docs"),
         true,
         None::<&str>,
     )?;
-    let guide = MenuItem::with_id(app, "web-guide", "Web UI Guide", true, None::<&str>)?;
+    let guide = MenuItem::with_id(
+        app,
+        "web-guide",
+        i18n::translate(locale, "menu.guide"),
+        true,
+        None::<&str>,
+    )?;
 
     let file = Submenu::with_items(
         app,
-        "File",
+        i18n::translate(locale, "menu.file"),
         true,
         &[
             &restart,
             #[cfg(not(target_os = "macos"))]
             &PredefinedMenuItem::separator(app)?,
             #[cfg(not(target_os = "macos"))]
-            &PredefinedMenuItem::quit(app, None)?,
+            &quit,
         ],
     )?;
 
     let edit = Submenu::with_items(
         app,
-        "Edit",
+        i18n::translate(locale, "menu.edit"),
         true,
         &[
             &PredefinedMenuItem::undo(app, None)?,
@@ -129,33 +243,53 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
             let devtools = MenuItem::with_id(
                 app,
                 "devtools",
-                "Toggle Developer Tools",
+                i18n::translate(locale, "menu.devtools"),
                 true,
                 Some("Alt+Cmd+I"),
             )?;
-            Submenu::with_items(app, "View", true, &[&reload, &fullscreen, &devtools])?
+            Submenu::with_items(
+                app,
+                i18n::translate(locale, "menu.view"),
+                true,
+                &[&reload, &fullscreen, &devtools],
+            )?
         }
         #[cfg(all(target_os = "macos", not(debug_assertions)))]
         {
             let fullscreen = PredefinedMenuItem::fullscreen(app, None)?;
-            Submenu::with_items(app, "View", true, &[&reload, &fullscreen])?
+            Submenu::with_items(
+                app,
+                i18n::translate(locale, "menu.view"),
+                true,
+                &[&reload, &fullscreen],
+            )?
         }
         #[cfg(all(not(target_os = "macos"), debug_assertions))]
         {
-            let devtools =
-                MenuItem::with_id(app, "devtools", "Toggle Developer Tools", true, Some("F12"))?;
-            Submenu::with_items(app, "View", true, &[&reload, &devtools])?
+            let devtools = MenuItem::with_id(
+                app,
+                "devtools",
+                i18n::translate(locale, "menu.devtools"),
+                true,
+                Some("F12"),
+            )?;
+            Submenu::with_items(
+                app,
+                i18n::translate(locale, "menu.view"),
+                true,
+                &[&reload, &devtools],
+            )?
         }
         #[cfg(all(not(target_os = "macos"), not(debug_assertions)))]
         {
-            Submenu::with_items(app, "View", true, &[&reload])?
+            Submenu::with_items(app, i18n::translate(locale, "menu.view"), true, &[&reload])?
         }
     };
 
     let window = Submenu::with_id_and_items(
         app,
         tauri::menu::WINDOW_SUBMENU_ID,
-        "Window",
+        i18n::translate(locale, "menu.window"),
         true,
         &[
             &PredefinedMenuItem::minimize(app, None)?,
@@ -168,7 +302,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let help = Submenu::with_id_and_items(
         app,
         tauri::menu::HELP_SUBMENU_ID,
-        "Help",
+        i18n::translate(locale, "menu.help"),
         true,
         &[&docs, &guide],
     )?;
@@ -186,7 +320,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
             &PredefinedMenuItem::hide(app, None)?,
             &PredefinedMenuItem::hide_others(app, None)?,
             &PredefinedMenuItem::separator(app)?,
-            &PredefinedMenuItem::quit(app, None)?,
+            &quit,
         ],
     )?;
 

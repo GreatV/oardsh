@@ -1,3 +1,5 @@
+use std::env;
+
 use serde_json::Value;
 
 const EN: &str = include_str!("../locales/en.json");
@@ -28,6 +30,56 @@ pub fn normalize_locale(locale: &str) -> &'static str {
     }
 }
 
+/// Tray labels follow the OS language. The boot screen does the same; dsh's
+/// own language preference is not available until the server is up.
+pub fn system_locale() -> &'static str {
+    for key in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+        if let Ok(value) = env::var(key) {
+            if !value.is_empty() && value != "C" && value != "POSIX" {
+                return normalize_locale(&value);
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = std::process::Command::new("defaults")
+            .args(["read", "-g", "AppleLocale"])
+            .output()
+        {
+            if output.status.success() {
+                let value = String::from_utf8_lossy(&output.stdout);
+                return normalize_locale(value.trim());
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Some(value) = windows_ui_locale() {
+            return normalize_locale(&value);
+        }
+    }
+    "en"
+}
+
+/// Windows GUI launches do not set LANG. Use the display language, not the
+/// regional format locale, so a Chinese UI stays Chinese.
+#[cfg(windows)]
+fn windows_ui_locale() -> Option<String> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetUserDefaultUILanguage() -> u16;
+        fn LCIDToLocaleName(locale: u32, name: *mut u16, cch_name: i32, flags: u32) -> i32;
+    }
+    let langid = unsafe { GetUserDefaultUILanguage() };
+    let mut buf = [0u16; 85];
+    let len = unsafe { LCIDToLocaleName(u32::from(langid), buf.as_mut_ptr(), buf.len() as i32, 0) };
+    if len > 1 {
+        Some(String::from_utf16_lossy(&buf[..len as usize - 1]))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{normalize_locale, translate};
@@ -39,6 +91,16 @@ mod tests {
         assert_eq!(
             translate("en", "notification.completed.title"),
             "dsh finished the current turn"
+        );
+        assert_eq!(translate("zh-CN", "tray.quit"), "退出 oardsh");
+        assert_eq!(
+            translate("en", "notification.crash.title"),
+            "dsh stopped unexpectedly"
+        );
+        assert_eq!(translate("zh-CN", "menu.file"), "文件");
+        assert_eq!(
+            translate("en", "notification.tray.title"),
+            "oardsh is still running"
         );
     }
 }

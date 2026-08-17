@@ -2,7 +2,12 @@
 /// `allow-*` permissions the capability files grant per origin; without them
 /// Tauri rejects every app command from the remote dsh pages. Keep in sync
 /// with `generate_handler!` in `src/lib.rs`.
-const COMMANDS: &[&str] = &["dsh_status", "native_web_event", "token_usage"];
+const COMMANDS: &[&str] = &[
+    "dsh_status",
+    "native_web_event",
+    "restart_dsh",
+    "token_usage",
+];
 
 fn main() {
     tauri_build::try_build(

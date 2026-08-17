@@ -34,8 +34,15 @@ async function brandMask() {
   return `data:image/png;base64,${png.toString("base64")}`;
 }
 
+/// The dsh release the injections were written against. Baked in so a lapsed
+/// contract can name it, and read from the root manifest rather than the
+/// prepared runtime, which does not exist yet on a clean checkout.
+const pinned = JSON.parse(readFileSync(join(root, "../../package.json"), "utf8"));
+const dshVersion = pinned.dependencies["@deepseek-ai/dsh"].replace(/^[\^~]/, "");
+
 const output = template
   .replace("__OARDSH_MESSAGES__", JSON.stringify(messages))
+  .replace("__OARDSH_DSH_VERSION__", dshVersion)
   .replace("__OARDSH_MARK__", await brandMask());
 mkdirSync(join(root, "lib"), { recursive: true });
 writeFileSync(join(root, "lib/client.js"), output);

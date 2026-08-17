@@ -1,6 +1,9 @@
 {
   "boot.starting": "Starting dsh Web…",
   "boot.failed": "dsh Web could not start",
-  "boot.description": "oardsh will open dsh Web directly in this window.",
-  "boot.details": "Startup details"
+  "boot.failedCrash": "dsh Web stopped unexpectedly",
+  "boot.description": "oardsh opens dsh Web in this window. Closing the window hides it; dsh keeps running in the tray.",
+  "boot.crashHint": "If a session is still marked running, open it after restart and stop it there.",
+  "boot.details": "Startup details",
+  "boot.restart": "Restart"
 }

@@ -39,6 +39,19 @@ html, body, #root { min-height: 100%; margin: 0; }
 .boot pre { width: min(620px, 90vw); max-height: 240px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; margin: 14px 0 0; padding: 10px 12px; border: 1px solid #e1e3e7; border-radius: 9px; background: #fff; color: #b3261e; font: 12px/18px ui-monospace, SFMono-Regular, Menlo, monospace; text-align: left; }
 .boot details { width: min(620px, 90vw); margin-top: 12px; color: #81858c; font-size: 12px; }
 .boot details pre { width: 100%; color: inherit; }
+.boot-button {
+  margin-top: 16px;
+  height: 30px;
+  padding: 0 14px;
+  border: 1px solid #d0d3d8;
+  border-radius: 15px;
+  background: #fff;
+  color: #202124;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.boot-button:hover { background: #f0f1f3; }
 @keyframes paddle { to { background-position: -704px 0; } }
 
 @keyframes whale-breathe {
@@ -51,6 +64,8 @@ html, body, #root { min-height: 100%; margin: 0; }
   .boot-mark { filter: invert(1); }
   .boot-mark.failed { filter: invert(1) opacity(.6); }
   .boot pre { border-color: #34363b; background: #202125; color: #ff8e89; }
+  .boot-button { border-color: #34363b; background: #202125; color: #e7e8ea; }
+  .boot-button:hover { background: #2a2b2f; }
 }
 
 @media (prefers-reduced-motion: reduce) {
