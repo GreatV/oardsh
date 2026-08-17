@@ -3,7 +3,6 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
@@ -11,7 +10,6 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, Url, WebviewWindow};
-use tauri_plugin_notification::NotificationExt;
 
 use crate::i18n;
 use crate::paths;
@@ -21,8 +19,6 @@ use crate::sidecar;
 
 const LOG_LIMIT: usize = 400;
 const START_TIMEOUT: Duration = Duration::from_secs(120);
-/// The dsh page can call `native_web_event`, so its body is untrusted length.
-const NOTIFICATION_BODY_LIMIT: usize = 180;
 const HOST: &str = "127.0.0.1";
 const WATCH_INTERVAL: Duration = Duration::from_millis(400);
 const AUTO_RESTART_MAX: u32 = 1;
@@ -34,9 +30,6 @@ const PEER_PORT: u16 = 3080;
 /// The main window's original URL, captured at setup so stopping can navigate
 /// back. It differs per platform and build, so it must not be hardcoded.
 static BOOT_URL: OnceLock<Url> = OnceLock::new();
-/// Dock/taskbar badge for approval/question while the window is hidden or
-/// unfocused. Cleared when the window is shown.
-static ATTENTION: AtomicU32 = AtomicU32::new(0);
 
 enum Supervised {
     Spawned(Child),
@@ -330,16 +323,7 @@ impl Engine {
         set_tray_tooltip(app, "tray.tooltip.ready");
         emit_status(app, self);
         let raise = self.lock().raise_on_ready;
-        let peer = self.lock().peer_dsh;
         present_dsh(app, &url, raise)?;
-        if peer {
-            let locale = i18n::system_locale();
-            show_clickable_notification(
-                app,
-                &i18n::translate(locale, "notification.peer.title"),
-                &i18n::translate(locale, "notification.peer.body"),
-            );
-        }
         self.watch_ready(app, generation);
         Ok(())
     }
@@ -415,7 +399,6 @@ impl Engine {
             }
         };
         sidecar::clear();
-        let locale = i18n::system_locale();
         if auto {
             if visible {
                 if let (Some(window), Some(url)) = (app.get_webview_window("main"), BOOT_URL.get())
@@ -428,11 +411,6 @@ impl Engine {
                 "stdout",
                 format!("Auto-restarting after unexpected exit (code {code})"),
             );
-            show_clickable_notification(
-                app,
-                &i18n::translate(locale, "notification.restart.title"),
-                &i18n::translate(locale, "notification.restart.body"),
-            );
             return;
         }
         set_tray_tooltip(app, "tray.tooltip.stopped");
@@ -441,11 +419,6 @@ impl Engine {
             let _ = window.navigate(url.clone());
         }
         reveal_main(app);
-        show_clickable_notification(
-            app,
-            &i18n::translate(locale, "notification.crash.title"),
-            &i18n::translate(locale, "notification.crash.body"),
-        );
     }
 
     fn fail(&self, app: &AppHandle, generation: u64, message: &str) {
@@ -579,67 +552,9 @@ pub fn dsh_status(engine: State<Engine>) -> Status {
     engine.status()
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NativeWebEvent {
-    kind: String,
-    body: String,
-    language: String,
-}
-
-#[tauri::command]
-pub fn native_web_event(app: AppHandle, event: NativeWebEvent) {
-    let title_key = match event.kind.as_str() {
-        "approval" => "notification.approval.title",
-        "question" => "notification.question.title",
-        "completed" => "notification.completed.title",
-        _ => "notification.updated.title",
-    };
-    let body_key = match event.kind.as_str() {
-        "approval" => "notification.approval.body",
-        "question" => "notification.question.body",
-        "completed" => "notification.webCompleted.body",
-        _ => "notification.updated.body",
-    };
-    let title = i18n::translate(&event.language, title_key);
-    let body = if event.body.trim().is_empty() {
-        i18n::translate(&event.language, body_key)
-    } else {
-        truncate(event.body.trim(), NOTIFICATION_BODY_LIMIT)
-    };
-    match event.kind.as_str() {
-        "approval" => set_tray_tooltip(&app, "tray.tooltip.approval"),
-        "question" => set_tray_tooltip(&app, "tray.tooltip.question"),
-        "completed" => set_tray_tooltip(&app, "tray.tooltip.ready"),
-        _ => {}
-    }
-    let alert = desktop_alert(
-        event.kind.as_str(),
-        window_in_background(&app),
-        window_is_concealed(&app),
-    );
-    if alert.badge {
-        add_attention(&app);
-    }
-    if alert.bounce {
-        request_attention(&app);
-    }
-    if alert.notify {
-        show_clickable_notification(&app, &title, &body);
-    }
-}
-
 #[tauri::command]
 pub fn restart_dsh(app: AppHandle) {
     restart_from_menu(&app);
-}
-
-/// Cut on a character count, never a byte offset, so multi-byte input cannot panic.
-fn truncate(value: &str, limit: usize) -> String {
-    match value.char_indices().nth(limit) {
-        Some((end, _)) => format!("{}…", &value[..end]),
-        None => value.to_string(),
-    }
 }
 
 pub fn restart_from_menu(app: &AppHandle) {
@@ -661,7 +576,6 @@ pub fn quit_app(app: &AppHandle) {
 }
 
 pub fn reveal_main(app: &AppHandle) {
-    clear_attention(app);
     if let Some(window) = current_window(app) {
         let _ = window.unminimize();
         let _ = window.show();
@@ -705,24 +619,8 @@ fn set_tray_tooltip(app: &AppHandle, key: &str) {
     }
 }
 
-fn request_attention(app: &AppHandle) {
-    if let Some(window) = current_window(app) {
-        let _ = window.request_user_attention(Some(tauri::UserAttentionType::Informational));
-    }
-}
-
 pub fn note_hidden_to_tray(app: &AppHandle) {
     app.state::<Engine>().suppress_raise();
-    if sidecar::tray_hint_seen() {
-        return;
-    }
-    sidecar::mark_tray_hint_seen();
-    let locale = i18n::system_locale();
-    show_clickable_notification(
-        app,
-        &i18n::translate(locale, "notification.tray.title"),
-        &i18n::translate(locale, "notification.tray.body"),
-    );
 }
 
 pub fn reload_main(app: &AppHandle) {
@@ -743,139 +641,6 @@ fn kill_supervised(supervised: &mut Supervised) {
         }
         Supervised::Adopted { pid, entry } => sidecar::kill_if_ours(*pid, entry),
     }
-}
-
-fn window_in_background(app: &AppHandle) -> bool {
-    match current_window(app) {
-        None => true,
-        Some(window) => {
-            !window.is_visible().unwrap_or(false) || !window.is_focused().unwrap_or(false)
-        }
-    }
-}
-
-fn window_is_concealed(app: &AppHandle) -> bool {
-    match current_window(app) {
-        None => true,
-        Some(window) => {
-            !window.is_visible().unwrap_or(false) || window.is_minimized().unwrap_or(false)
-        }
-    }
-}
-
-/// Completed turns only notify. Dock bounce is reserved for a hidden or
-/// minimized window that needs the user (approval / a question) — bouncing
-/// on every finished turn while oardsh is just unfocused is what made the
-/// macOS icon jump constantly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DesktopAlert {
-    notify: bool,
-    badge: bool,
-    bounce: bool,
-}
-
-fn desktop_alert(kind: &str, background: bool, concealed: bool) -> DesktopAlert {
-    if !background {
-        return DesktopAlert {
-            notify: false,
-            badge: false,
-            bounce: false,
-        };
-    }
-    let needs_action = matches!(kind, "approval" | "question");
-    DesktopAlert {
-        notify: true,
-        badge: needs_action,
-        bounce: needs_action && concealed,
-    }
-}
-
-fn add_attention(app: &AppHandle) {
-    if !window_in_background(app) {
-        return;
-    }
-    let count = ATTENTION.fetch_add(1, Ordering::Relaxed).saturating_add(1);
-    if let Some(window) = current_window(app) {
-        let _ = window.set_badge_count(Some(i64::from(count)));
-    }
-}
-
-pub fn clear_attention(app: &AppHandle) {
-    ATTENTION.store(0, Ordering::Relaxed);
-    if let Some(window) = current_window(app) {
-        let _ = window.set_badge_count(None);
-    }
-}
-
-fn show_clickable_notification(app: &AppHandle, title: &str, body: &str) {
-    #[cfg(any(target_os = "macos", windows))]
-    let identifier = app.config().identifier.clone();
-    let title = title.to_string();
-    let body = body.to_string();
-    let handle = app.clone();
-    thread::spawn(move || {
-        #[cfg(target_os = "macos")]
-        {
-            let _ = notify_rust::set_application(if tauri::is_dev() {
-                "com.apple.Terminal"
-            } else {
-                &identifier
-            });
-        }
-        let mut notification = notify_rust::Notification::new();
-        notification
-            .summary(&title)
-            .body(&body)
-            .action("default", "Open");
-        #[cfg(windows)]
-        {
-            let exe_dir = tauri::utils::platform::current_exe()
-                .ok()
-                .and_then(|exe| exe.parent().map(|dir| dir.display().to_string()));
-            if let Some(dir) = exe_dir {
-                let sep = std::path::MAIN_SEPARATOR;
-                if !(dir.ends_with(&format!("{sep}target{sep}debug"))
-                    || dir.ends_with(&format!("{sep}target{sep}release")))
-                {
-                    notification.app_id(&identifier);
-                }
-            }
-        }
-        match notification.show() {
-            Ok(shown) => {
-                // macOS NSUserNotification delivers clicks on the main run
-                // loop; a worker thread would block forever. Reopen/Focused
-                // brings the window forward when the notification activates
-                // the app. Other platforms wait here.
-                #[cfg(target_os = "macos")]
-                {
-                    let _ = shown;
-                    let _ = handle;
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    let _ =
-                        shown.wait_for_response(|response: &notify_rust::NotificationResponse| {
-                            if matches!(
-                                response,
-                                notify_rust::NotificationResponse::Default
-                                    | notify_rust::NotificationResponse::Action(_)
-                            ) {
-                                reveal_main(&handle);
-                            }
-                        });
-                }
-            }
-            Err(_) => {
-                let _ = handle
-                    .notification()
-                    .builder()
-                    .title(&title)
-                    .body(&body)
-                    .show();
-            }
-        }
-    });
 }
 
 fn spawn_reader<R: Read + Send + 'static>(
@@ -1043,15 +808,7 @@ pub(crate) fn kill_child(child: &mut Child) {
 
 #[cfg(test)]
 mod tests {
-    use super::{announced_url, desktop_alert, truncate};
-
-    #[test]
-    fn truncates_on_character_boundaries() {
-        assert_eq!(truncate("short", 8), "short");
-        assert_eq!(truncate("abcdefghij", 4), "abcd…");
-        // Byte slicing here would panic: each character is three bytes.
-        assert_eq!(truncate("需要你的批准", 3), "需要你…");
-    }
+    use super::announced_url;
 
     #[test]
     fn parses_dynamic_port_announcement() {
@@ -1071,50 +828,6 @@ mod tests {
         assert_eq!(
             announced_url("listening on http://127.0.0.1:8080."),
             Some("http://127.0.0.1:8080".into())
-        );
-    }
-
-    #[test]
-    fn desktop_alert_does_not_bounce_on_completed_or_unfocused_window() {
-        assert_eq!(
-            desktop_alert("completed", true, false),
-            super::DesktopAlert {
-                notify: true,
-                badge: false,
-                bounce: false
-            }
-        );
-        assert_eq!(
-            desktop_alert("completed", true, true),
-            super::DesktopAlert {
-                notify: true,
-                badge: false,
-                bounce: false
-            }
-        );
-        assert_eq!(
-            desktop_alert("approval", true, false),
-            super::DesktopAlert {
-                notify: true,
-                badge: true,
-                bounce: false
-            }
-        );
-        assert_eq!(
-            desktop_alert("question", true, true),
-            super::DesktopAlert {
-                notify: true,
-                badge: true,
-                bounce: true
-            }
-        );
-        assert_eq!(
-            desktop_alert("approval", false, true),
-            super::DesktopAlert {
-                notify: false,
-                badge: false,
-                bounce: false
-            }
         );
     }
 

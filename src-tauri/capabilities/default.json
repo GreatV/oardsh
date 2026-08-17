@@ -6,7 +6,6 @@
   "permissions": [
     "core:default",
     "opener:default",
-    "notification:default",
     "allow-dsh-status",
     "allow-restart-dsh"
   ]

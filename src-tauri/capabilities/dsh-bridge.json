@@ -7,7 +7,6 @@
     "urls": ["http://127.0.0.1:*"]
   },
   "permissions": [
-    "allow-native-web-event",
     "allow-token-usage",
     "allow-proxy-config",
     "allow-set-proxy-config"

@@ -1,6 +1,6 @@
 [package]
 name = "oardsh"
-version = "0.1.0"
+version = "0.1.1"
 description = "Native desktop shell for DeepSeek Harness (dsh web)"
 authors = ["Wang Xin"]
 edition = "2021"
@@ -18,11 +18,15 @@ serde_json = "1"
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
 tauri-plugin-window-state = "2"
-tauri-plugin-notification = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-dialog = "2"
-notify-rust = "4"
 zstd = "0.13"
+
+# Linux is absent on purpose: rfd's default gtk3 feature collides with the
+# xdg-portal one tauri-plugin-dialog builds it with there, and download.rs
+# keeps wry's default destination on that platform anyway.
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+rfd = "0.16"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

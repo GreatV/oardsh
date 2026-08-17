@@ -1,3 +1,4 @@
+mod download;
 mod engine;
 mod i18n;
 mod paths;
@@ -26,12 +27,10 @@ pub fn run() {
                 .with_state_flags(StateFlags::all().difference(StateFlags::VISIBLE))
                 .build(),
         )
-        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(Engine::new())
         .invoke_handler(tauri::generate_handler![
             engine::dsh_status,
-            engine::native_web_event,
             engine::restart_dsh,
             proxy::proxy_config,
             proxy::set_proxy_config,
@@ -41,18 +40,17 @@ pub fn run() {
             let menu = build_menu(app.handle())?;
             app.set_menu(menu)?;
             build_tray(app.handle())?;
+            build_main_window(app.handle())?;
             engine::remember_boot_url(app.handle());
             engine::boot_dsh(app.handle());
             Ok(())
         })
-        .on_window_event(|window, event| match event {
-            tauri::WindowEvent::CloseRequested { api, .. } => {
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
                 engine::note_hidden_to_tray(window.app_handle());
             }
-            tauri::WindowEvent::Focused(true) => engine::clear_attention(window.app_handle()),
-            _ => {}
         })
         .on_menu_event(|app, event| match event.id().as_ref() {
             "restart" => engine::restart_from_menu(app),
@@ -96,6 +94,20 @@ pub fn run() {
             RunEvent::Reopen { .. } => engine::reveal_main(app),
             _ => {}
         });
+}
+
+/// The main window is built here instead of tauri.conf.json because a download
+/// handler can only be attached in code, and the dsh page depends on it for its
+/// session-log export. Keep the geometry in sync with what the config carried.
+fn build_main_window(app: &AppHandle) -> tauri::Result<()> {
+    tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
+        .title("DeepSeek Harness")
+        .inner_size(1440.0, 900.0)
+        .min_inner_size(960.0, 640.0)
+        .center()
+        .on_download(download::handle)
+        .build()?;
+    Ok(())
 }
 
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {

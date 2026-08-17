@@ -760,41 +760,33 @@ window.__ModuleLoader__.load({
         };
       }, "oardsh: hover-open context meter");
 
+      // dsh's session-log modal narrates the browser download it thinks it
+      // started ("Session 导出已开始下载"); in the desktop shell the native
+      // save dialog and the completion toast own that story, so close the
+      // success state once it appears. The preparing state is left open:
+      // dismissing it flips the controller's `open` flag, and a failed
+      // preflight then publishes its error with the modal already closed —
+      // the export could fail with no feedback at all. React swaps preparing
+      // for success by rewriting the dialog's text and aria-label in place,
+      // so those mutations are watched too.
       ctx.effect(() => {
-        if (typeof window.__TAURI_INTERNALS__?.invoke !== "function") return;
-        let lastSignal = "";
-        let runningSince = 0;
-        let wasRunning = false;
-        const notify = async (kind, body = "") => {
-          const signal = `${kind}:${body}`;
-          if (signal === lastSignal) return;
-          lastSignal = signal;
-          await invoke("native_web_event", { event: { kind, body, language: locale() } }).catch(() => {});
+        const transientTitles = new Set([
+          "Session 导出已开始下载", "Session download started",
+        ]);
+        const closeTransientModal = () => {
+          for (const dialog of document.querySelectorAll('[role="dialog"][aria-modal="true"]')) {
+            if (!transientTitles.has(dialog.getAttribute("aria-label") || "")) continue;
+            document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+            return;
+          }
         };
-        const scan = () => {
-          const approval = document.querySelector("[data-approval-key],[data-cordis-awaiting]");
-          const question = document.querySelector("[data-question-key]");
-          const running = Boolean(document.querySelector('[data-state="running"]'));
-          if (running && !wasRunning) { runningSince = Date.now(); lastSignal = ""; }
-          if (!running && wasRunning && Date.now() - runningSince > 2500 && !approval && !question) notify("completed", document.title);
-          wasRunning = running;
-          if (approval) notify("approval", approval.textContent?.trim().slice(0, 180) || t("notifications.approval"));
-          else if (question) notify("question", question.textContent?.trim().slice(0, 180) || t("notifications.question"));
-        };
-
-        // A streaming reply mutates on nearly every frame and each scan walks
-        // the whole tree, so coalesce bursts into one scan per frame.
-        let queued = 0;
-        const schedule = () => {
-          if (queued) return;
-          queued = window.requestAnimationFrame(() => { queued = 0; scan(); });
-        };
-        const observer = new MutationObserver(schedule);
-        observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["data-state", "data-approval-key", "data-question-key"] });
-        const timer = window.setInterval(scan, 1200);
-        scan();
-        return () => { observer.disconnect(); window.clearInterval(timer); if (queued) window.cancelAnimationFrame(queued); };
-      }, "oardsh: native agent notifications");
+        const observer = new MutationObserver(closeTransientModal);
+        observer.observe(document.body, {
+          childList: true, subtree: true, characterData: true,
+          attributes: true, attributeFilter: ["aria-label"],
+        });
+        return () => observer.disconnect();
+      }, "oardsh: suppress dsh session-export modal");
     }
     exports.apply = apply;
     exports.inject = inject;
