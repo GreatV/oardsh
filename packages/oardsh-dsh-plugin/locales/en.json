@@ -35,7 +35,7 @@
   "statsPlacement.ring": "Context ring",
   "statsPlacement.dsh": "dsh default",
   "proxy.title": "Network proxy",
-  "proxy.help": "Provided by oardsh: send dsh API and tool traffic through a proxy. Apply restarts the server. Loopback addresses are never proxied. Manual mode needs Node 22.21+ or a packaged oardsh.",
+  "proxy.help": "Provided by oardsh: send dsh API and tool traffic through a proxy. Apply restarts the server. Loopback addresses are never proxied. dsh API fetch needs Node 22.21+ or a packaged oardsh; System still applies HTTP_PROXY to tools on older Node.",
   "proxy.mode.off": "Off",
   "proxy.mode.system": "System",
   "proxy.mode.manual": "Manual",

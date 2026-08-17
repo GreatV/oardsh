@@ -232,11 +232,18 @@ pub(crate) fn persist_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
     if fs::rename(&tmp, path).is_ok() {
         return Ok(());
     }
-    // Windows cannot rename over an existing file.
-    let _ = fs::remove_file(path);
+    // Windows cannot rename over an existing file. Move the old file aside
+    // first so a failed second rename can put it back.
+    let bak = path.with_extension("bak");
+    let _ = fs::remove_file(&bak);
+    fs::rename(path, &bak)?;
     match fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            let _ = fs::remove_file(&bak);
+            Ok(())
+        }
         Err(err) => {
+            let _ = fs::rename(&bak, path);
             let _ = fs::remove_file(&tmp);
             Err(err)
         }
