@@ -3,10 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use tauri::webview::DownloadEvent;
-use tauri::{Webview, Wry};
-
-#[cfg(not(target_os = "linux"))]
-use tauri::Manager;
+use tauri::{Manager, Webview, Wry};
 
 use crate::i18n;
 
@@ -20,8 +17,7 @@ pub fn handle(webview: Webview<Wry>, event: DownloadEvent<'_>) -> bool {
         DownloadEvent::Requested { url, destination } => {
             match pick_destination(&webview, &url, destination) {
                 Some(path) => {
-                    remember(url.as_str(), path.clone());
-                    *destination = staging_destination(url.as_str(), path);
+                    *destination = remember(url.as_str(), path);
                     true
                 }
                 None => {
@@ -38,23 +34,32 @@ pub fn handle(webview: Webview<Wry>, event: DownloadEvent<'_>) -> bool {
     }
 }
 
+/// One in-flight save choice: where the user wants the archive, and — when
+/// the platform cannot put the transfer straight there — where it is
+/// actually writing in the meantime.
+struct Choice {
+    destination: PathBuf,
+    #[cfg(target_os = "macos")]
+    staged: Option<PathBuf>,
+}
+
 /// Finished carries no path on macOS (WKWebView API limitation), so remember
 /// what the user chose — a FIFO per URL, because exporting the same session
 /// again while its first ZIP still streams must not overwrite the first
-/// choice. Completions are matched to choices by order, the only identity
-/// wry exposes; dsh itself serialises a session's exports until its save
-/// starts, so ordering only escapes when two transfers of one URL finish
-/// out of turn, and the cost is two real destinations announced swapped.
-/// Bounded, because a download that never finishes would otherwise leak its
-/// entry.
-static CHOSEN: OnceLock<Mutex<HashMap<String, VecDeque<PathBuf>>>> = OnceLock::new();
+/// choice; a choice and its staging file are consumed as a pair. Completions
+/// are matched to choices by order, the only identity wry exposes; dsh itself
+/// serialises a session's exports until its save starts, so ordering only
+/// escapes when two transfers of one URL finish out of turn, and the cost is
+/// two real destinations announced swapped. Drained keys are removed, so the
+/// size bound is only a leak guard against a download that never finishes.
+static CHOSEN: OnceLock<Mutex<HashMap<String, VecDeque<Choice>>>> = OnceLock::new();
 
 /// Save-dialog cancellations. The shell rejects such downloads on purpose,
 /// yet WebView2 still reports them back as failed downloads; remembering the
 /// cancellation keeps the failure toast off what was a deliberate choice.
 static CANCELLED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
-fn chosen() -> &'static Mutex<HashMap<String, VecDeque<PathBuf>>> {
+fn chosen() -> &'static Mutex<HashMap<String, VecDeque<Choice>>> {
     CHOSEN.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -62,20 +67,39 @@ fn cancelled() -> &'static Mutex<HashSet<String>> {
     CANCELLED.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-fn remember(url: &str, path: PathBuf) {
+/// Record where the user chose to put the download and return the path the
+/// transfer itself should write to. macOS cannot write onto an existing
+/// file, so a confirmed replacement stages beside the target and is moved
+/// over it when the transfer finishes (see `announce`).
+fn remember(url: &str, destination: PathBuf) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    let staged = staging_sibling(&destination);
+    #[cfg(target_os = "macos")]
+    let effective = staged.clone().unwrap_or_else(|| destination.clone());
+    #[cfg(not(target_os = "macos"))]
+    let effective = destination.clone();
     let mut chosen = chosen().lock().unwrap_or_else(|err| err.into_inner());
     if chosen.len() >= 32 {
         chosen.clear();
     }
-    chosen.entry(url.to_string()).or_default().push_back(path);
+    chosen
+        .entry(url.to_string())
+        .or_default()
+        .push_back(Choice {
+            destination,
+            #[cfg(target_os = "macos")]
+            staged,
+        });
+    effective
 }
 
-fn take(url: &str) -> Option<PathBuf> {
-    chosen()
-        .lock()
-        .unwrap_or_else(|err| err.into_inner())
-        .get_mut(url)
-        .and_then(VecDeque::pop_front)
+fn take(url: &str) -> Option<Choice> {
+    let mut chosen = chosen().lock().unwrap_or_else(|err| err.into_inner());
+    let choice = chosen.get_mut(url).and_then(VecDeque::pop_front);
+    if choice.is_some() && chosen.get(url).is_some_and(|queue| queue.is_empty()) {
+        chosen.remove(url);
+    }
+    choice
 }
 
 fn mark_cancelled(url: &str) {
@@ -93,94 +117,6 @@ fn take_cancelled(url: &str) -> bool {
         .remove(url)
 }
 
-/// Linux completion reporting cannot be trusted after any failure (see
-/// `announce`); a chosen destination that exists on disk is the truth left.
-#[cfg(target_os = "linux")]
-fn arrived(url: &str) -> bool {
-    chosen()
-        .lock()
-        .unwrap_or_else(|err| err.into_inner())
-        .get(url)
-        .and_then(|queue| queue.front())
-        .is_some_and(|path| path.exists())
-}
-
-/// WKDownload fails rather than replaces an existing file, so a user who
-/// confirms the save panel's replacement prompt would lose the transfer.
-/// Stage beside the target instead, and move over it on completion (see
-/// `settle`). The staging paths join the same per-URL FIFO as the choices,
-/// so a download's staging file and destination are consumed as a pair.
-#[cfg(target_os = "macos")]
-static PENDING: OnceLock<Mutex<HashMap<String, VecDeque<PathBuf>>>> = OnceLock::new();
-
-#[cfg(target_os = "macos")]
-fn pending() -> &'static Mutex<HashMap<String, VecDeque<PathBuf>>> {
-    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// The URL a finished transfer settles at: the user's chosen path directly,
-/// unless that path existed — then a fresh hidden sibling to stage through.
-#[cfg(target_os = "macos")]
-fn staging_destination(url: &str, destination: PathBuf) -> PathBuf {
-    if !destination.exists() {
-        return destination;
-    }
-    let name = destination
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let mut staged = destination.clone();
-    let mut counter = 0;
-    loop {
-        counter += 1;
-        staged.set_file_name(format!(".{name}.oardsh-{counter}.part"));
-        if !staged.exists() {
-            break;
-        }
-    }
-    let mut pending = pending().lock().unwrap_or_else(|err| err.into_inner());
-    if pending.len() >= 32 {
-        pending.clear();
-    }
-    pending
-        .entry(url.to_string())
-        .or_default()
-        .push_back(staged.clone());
-    staged
-}
-
-#[cfg(not(target_os = "macos"))]
-fn staging_destination(_url: &str, destination: PathBuf) -> PathBuf {
-    destination
-}
-
-/// Move a finished staging file over the destination it stands in for.
-#[cfg(target_os = "macos")]
-fn settle(url: &str, destination: Option<PathBuf>) -> Option<PathBuf> {
-    let destination = destination?;
-    match pending()
-        .lock()
-        .unwrap_or_else(|err| err.into_inner())
-        .get_mut(url)
-        .and_then(VecDeque::pop_front)
-    {
-        Some(temp) if std::fs::rename(&temp, &destination).is_ok() => Some(destination),
-        // The move failed — say where the archive actually is rather than
-        // claim a save that did not land.
-        Some(temp) => Some(temp),
-        None => Some(destination),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn take_pending(url: &str) -> Option<PathBuf> {
-    pending()
-        .lock()
-        .unwrap_or_else(|err| err.into_inner())
-        .get_mut(url)
-        .and_then(VecDeque::pop_front)
-}
-
 fn announce(webview: &Webview<Wry>, url: &tauri::Url, path: Option<PathBuf>, success: bool) {
     let locale = i18n::system_locale();
     // wry 0.55's webkitgtk backend tracks download failure on one flag for
@@ -192,17 +128,26 @@ fn announce(webview: &Webview<Wry>, url: &tauri::Url, path: Option<PathBuf>, suc
     // later export reading as failed.
     #[cfg(target_os = "linux")]
     let success = success || arrived(url.as_str());
-    // Consume the remembered choice on every completion, reported path or
-    // not, so a later download of the same URL never inherits a stale one;
-    // the platform's path is only what gets displayed.
-    let remembered = take(url.as_str());
+    // Consume the choice on every completion, reported path or not, so a
+    // later download of the same URL never inherits a stale one; the
+    // platform's path is only what gets displayed.
+    let choice = take(url.as_str());
     let text = if success {
         // macOS: WKDownload cannot write onto an existing file, so a
-        // replacement the user confirmed in the save panel was staged
-        // beside the target; move it into place now.
+        // replacement the user confirmed in the save panel was staged beside
+        // the target; move it into place now.
         #[cfg(target_os = "macos")]
-        let remembered = settle(url.as_str(), remembered);
-        match path.or(remembered) {
+        let choice = choice.map(|mut choice| {
+            if let Some(staged) = choice.staged.take() {
+                if std::fs::rename(&staged, &choice.destination).is_err() {
+                    // The move failed — say where the archive actually is
+                    // rather than claim a save that did not land.
+                    choice.destination = staged;
+                }
+            }
+            choice
+        });
+        match path.or_else(|| choice.map(|choice| choice.destination)) {
             Some(path) => format!(
                 "{}: {}",
                 i18n::translate(locale, "download.saved"),
@@ -216,12 +161,67 @@ fn announce(webview: &Webview<Wry>, url: &tauri::Url, path: Option<PathBuf>, suc
         return;
     } else {
         #[cfg(target_os = "macos")]
-        if let Some(temp) = take_pending(url.as_str()) {
-            let _ = std::fs::remove_file(temp);
+        if let Some(staged) = choice.as_ref().and_then(|choice| choice.staged.as_ref()) {
+            let _ = std::fs::remove_file(staged);
         }
         i18n::translate(locale, "download.failed")
     };
+    if park_while_hidden(webview, &text, success) {
+        return;
+    }
     let _ = webview.eval(toast_script(&text, success).as_str());
+}
+
+/// Linux completion reporting cannot be trusted after any failure (see
+/// `announce`); a chosen destination that exists on disk is the truth left.
+#[cfg(target_os = "linux")]
+fn arrived(url: &str) -> bool {
+    chosen()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .get(url)
+        .and_then(|queue| queue.front())
+        .is_some_and(|choice| choice.destination.exists())
+}
+
+/// Toasts that arrived while the main window was hidden to the tray. The
+/// page that would show them is off screen and the toast's own timer would
+/// spend itself unseen — and dsh's export modal is suppressed in the shell —
+/// so they replay when the window comes back.
+static UNSEEN: OnceLock<Mutex<Vec<(String, bool)>>> = OnceLock::new();
+
+fn unseen() -> &'static Mutex<Vec<(String, bool)>> {
+    UNSEEN.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Park the toast if the window cannot show it; reports whether it did.
+fn park_while_hidden(webview: &Webview<Wry>, text: &str, success: bool) -> bool {
+    let concealed = webview
+        .app_handle()
+        .get_webview_window("main")
+        .is_none_or(|window| {
+            !window.is_visible().unwrap_or(true) || window.is_minimized().unwrap_or(false)
+        });
+    if !concealed {
+        return false;
+    }
+    let mut unseen = unseen().lock().unwrap_or_else(|err| err.into_inner());
+    if unseen.len() >= 8 {
+        unseen.clear();
+    }
+    unseen.push((text.to_string(), success));
+    true
+}
+
+/// Show the toasts that piled up while the window was hidden.
+pub fn replay_unseen(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let parked = std::mem::take(&mut *unseen().lock().unwrap_or_else(|err| err.into_inner()));
+    for (text, success) in parked {
+        let _ = window.eval(toast_script(&text, success).as_str());
+    }
 }
 
 /// One idempotent toast in the corner of the dsh page; its CSS variables keep
@@ -286,9 +286,32 @@ fn pick_destination(
     Some(destination.to_path_buf())
 }
 
+/// WKDownload fails rather than replaces an existing file, so a user who
+/// confirms the save panel's replacement prompt would lose the transfer.
+/// Hand back a fresh hidden sibling to stage through instead.
+#[cfg(target_os = "macos")]
+fn staging_sibling(destination: &Path) -> Option<PathBuf> {
+    if !destination.exists() {
+        return None;
+    }
+    let name = destination
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut staged = destination.to_path_buf();
+    let mut counter = 0;
+    loop {
+        counter += 1;
+        staged.set_file_name(format!(".{name}.oardsh-{counter}.part"));
+        if !staged.exists() {
+            return Some(staged);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{mark_cancelled, remember, take, take_cancelled, toast_script};
+    use super::{chosen, mark_cancelled, remember, take, take_cancelled, toast_script};
     use std::path::PathBuf;
 
     // The maps behind these are process-global and tests run in parallel, so
@@ -296,9 +319,13 @@ mod tests {
     #[test]
     fn remembers_the_chosen_path_per_url() {
         let url = "http://127.0.0.1:1/api/session.export?sessionId=single";
-        remember(url, PathBuf::from(r"C:\Downloads\a.zip"));
-        assert_eq!(take(url), Some(PathBuf::from(r"C:\Downloads\a.zip")));
-        assert_eq!(take(url), None);
+        let effective = remember(url, PathBuf::from(r"C:\Downloads\a.zip"));
+        assert_eq!(effective, PathBuf::from(r"C:\Downloads\a.zip"));
+        assert_eq!(
+            take(url).map(|choice| choice.destination),
+            Some(PathBuf::from(r"C:\Downloads\a.zip"))
+        );
+        assert_eq!(take(url).map(|choice| choice.destination), None);
     }
 
     #[test]
@@ -306,9 +333,29 @@ mod tests {
         let url = "http://127.0.0.1:1/api/session.export?sessionId=queued";
         remember(url, PathBuf::from(r"C:\Downloads\first.zip"));
         remember(url, PathBuf::from(r"C:\Downloads\second.zip"));
-        assert_eq!(take(url), Some(PathBuf::from(r"C:\Downloads\first.zip")));
-        assert_eq!(take(url), Some(PathBuf::from(r"C:\Downloads\second.zip")));
-        assert_eq!(take(url), None);
+        assert_eq!(
+            take(url).map(|choice| choice.destination),
+            Some(PathBuf::from(r"C:\Downloads\first.zip"))
+        );
+        assert_eq!(
+            take(url).map(|choice| choice.destination),
+            Some(PathBuf::from(r"C:\Downloads\second.zip"))
+        );
+        assert_eq!(take(url).map(|choice| choice.destination), None);
+    }
+
+    #[test]
+    fn draining_a_url_releases_its_slot() {
+        let url = "http://127.0.0.1:1/api/session.export?sessionId=slot";
+        remember(url, PathBuf::from(r"C:\Downloads\slot.zip"));
+        assert!(take(url).is_some());
+        // A drained queue leaves no empty entry behind, so the leak bound
+        // can never evict a download that is still in flight.
+        assert!(chosen()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .get(url)
+            .is_none());
     }
 
     #[test]

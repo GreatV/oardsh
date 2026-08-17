@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, Url, WebviewWindow};
 
+use crate::download;
 use crate::i18n;
 use crate::paths;
 use crate::proxy;
@@ -581,6 +582,9 @@ pub fn reveal_main(app: &AppHandle) {
         let _ = window.show();
         let _ = window.set_focus();
     }
+    // Toasts that finished downloading while the window was hidden wait for
+    // exactly this moment.
+    download::replay_unseen(app);
 }
 
 fn emit_status(app: &AppHandle, engine: &Engine) {
