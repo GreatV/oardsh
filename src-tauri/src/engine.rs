@@ -208,7 +208,7 @@ impl Engine {
                     .and_then(|parsed| parsed.port_or_known_default())
                     .is_some_and(|port| ready::dsh_serving(HOST, port))
             },
-            &proxy::fingerprint(&proxy::load()),
+            &proxy::fingerprint(app, &proxy::load()),
         ) {
             {
                 let mut inner = self.lock();
@@ -280,7 +280,7 @@ impl Engine {
                 child.id(),
                 &program,
                 None,
-                Some(&proxy::fingerprint(&proxy::load())),
+                Some(&proxy::fingerprint(app, &proxy::load())),
             );
             inner.supervised = Some(Supervised::Spawned(child));
         }

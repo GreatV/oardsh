@@ -112,9 +112,11 @@ fn env_ops(
                 inherited.https.clone()
             };
             let mut ops = vec![("NODE_USE_ENV_PROXY", Some("1".into()))];
-            let (no_proxy_upper, no_proxy_lower) = system_no_proxy(inherited);
-            ops.push(("NO_PROXY", Some(no_proxy_upper)));
-            ops.push(("no_proxy", Some(no_proxy_lower)));
+            ops.extend(
+                system_no_proxy(inherited)
+                    .into_iter()
+                    .map(|(name, value)| (name, Some(value))),
+            );
             if !http.is_empty() {
                 ops.push(("HTTP_PROXY", Some(http.clone())));
                 ops.push(("http_proxy", Some(http)));
@@ -177,23 +179,25 @@ fn inherited_proxy() -> InheritedProxy {
     }
 }
 
-pub fn fingerprint(config: &ProxyConfig) -> String {
-    fingerprint_with(config, &inherited_proxy())
+pub fn fingerprint(app: &tauri::AppHandle, config: &ProxyConfig) -> String {
+    fingerprint_with(config, &inherited_proxy(), &probe_node_version(app))
 }
 
-fn fingerprint_with(config: &ProxyConfig, inherited: &InheritedProxy) -> String {
+fn fingerprint_with(config: &ProxyConfig, inherited: &InheritedProxy, node: &str) -> String {
     match config.mode {
-        // System traffic follows the launch environment, so adopt must
-        // refuse a leftover child after HTTP_PROXY / NO_PROXY change.
+        // System traffic follows the launch environment and the Node
+        // that honors NODE_USE_ENV_PROXY, so adopt must refuse a leftover
+        // child after those change.
         ProxyMode::System => format!(
-            "system|{}|{}|{}|{}",
+            "system|{}|{}|{}|{}|{}",
             inherited.http,
             inherited.https,
             inherited.all,
-            inherited.no_proxy()
+            inherited.no_proxy(),
+            node
         ),
         ProxyMode::Off => "off".into(),
-        ProxyMode::Manual => format!("manual|{}|{}", config.url, config.no_proxy),
+        ProxyMode::Manual => format!("manual|{}|{}|{}", config.url, config.no_proxy, node),
     }
 }
 
@@ -215,24 +219,21 @@ fn merge_no_proxy(user: &str) -> String {
     parts.join(",")
 }
 
-/// Shared list when it stays small; otherwise prepend loopback to the
-/// inherited value only, so a huge bypass list is not written twice.
-fn system_no_proxy(inherited: &InheritedProxy) -> (String, String) {
+/// Shared list when it stays small. A huge single-case inherited value is
+/// rewritten in place only, so it is not copied into the missing variant.
+fn system_no_proxy(inherited: &InheritedProxy) -> Vec<(&'static str, String)> {
     let merged = merge_no_proxy(&inherited.no_proxy());
     if merged.len() <= MERGED_NO_PROXY_MAX {
-        return (merged.clone(), merged);
+        return vec![("NO_PROXY", merged.clone()), ("no_proxy", merged)];
     }
-    let upper_src = if inherited.no_proxy_upper.is_empty() {
-        &inherited.no_proxy_lower
-    } else {
-        &inherited.no_proxy_upper
-    };
-    let lower_src = if inherited.no_proxy_lower.is_empty() {
-        &inherited.no_proxy_upper
-    } else {
-        &inherited.no_proxy_lower
-    };
-    (prepend_loopback(upper_src), prepend_loopback(lower_src))
+    let mut ops = Vec::new();
+    if !inherited.no_proxy_upper.is_empty() {
+        ops.push(("NO_PROXY", prepend_loopback(&inherited.no_proxy_upper)));
+    }
+    if !inherited.no_proxy_lower.is_empty() {
+        ops.push(("no_proxy", prepend_loopback(&inherited.no_proxy_lower)));
+    }
+    ops
 }
 
 fn prepend_loopback(user: &str) -> String {
@@ -295,6 +296,29 @@ fn config_path() -> Option<std::path::PathBuf> {
     paths::resolve_dsh_home().map(|home| std::path::PathBuf::from(home).join("oardsh.proxy.json"))
 }
 
+fn resolve_submitted_url(submitted: &str, stored: &str) -> String {
+    if !stored.is_empty() && submitted == redact_proxy_url(stored) {
+        return stored.to_string();
+    }
+    restore_redacted_userinfo(submitted, stored)
+}
+
+fn restore_redacted_userinfo(submitted: &str, stored: &str) -> String {
+    let Ok(mut submitted_url) = tauri::Url::parse(submitted) else {
+        return submitted.to_string();
+    };
+    let Ok(stored_url) = tauri::Url::parse(stored) else {
+        return submitted.to_string();
+    };
+    if submitted_url.username() == "****" {
+        let _ = submitted_url.set_username(stored_url.username());
+    }
+    if submitted_url.password() == Some("****") {
+        let _ = submitted_url.set_password(stored_url.password());
+    }
+    submitted_url.to_string()
+}
+
 fn redact_proxy_url(raw: &str) -> String {
     let Ok(mut parsed) = tauri::Url::parse(raw.trim()) else {
         return raw.to_string();
@@ -350,9 +374,9 @@ fn node_env_proxy_ok(version: &str) -> bool {
     major >= 24 || (major == 22 && minor >= 21)
 }
 
-fn node_supports_env_proxy(app: &tauri::AppHandle) -> bool {
+fn probe_node_version(app: &tauri::AppHandle) -> String {
     let Ok(node) = paths::resolve_node(app) else {
-        return false;
+        return String::new();
     };
     let mut probe = Command::new(node);
     probe.args(["-p", "process.versions.node"]);
@@ -362,9 +386,16 @@ fn node_supports_env_proxy(app: &tauri::AppHandle) -> bool {
         probe.creation_flags(0x0800_0000);
     }
     let Ok(output) = probe.output() else {
-        return false;
+        return String::new();
     };
-    output.status.success() && node_env_proxy_ok(&String::from_utf8_lossy(&output.stdout))
+    if !output.status.success() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn node_supports_env_proxy(app: &tauri::AppHandle) -> bool {
+    node_env_proxy_ok(&probe_node_version(app))
 }
 
 #[tauri::command]
@@ -384,11 +415,7 @@ pub fn set_proxy_config(
     }
     let mut config = ProxyConfig {
         mode,
-        url: if !stored.url.is_empty() && submitted == redact_proxy_url(&stored.url) {
-            stored.url.clone()
-        } else {
-            submitted.to_string()
-        },
+        url: resolve_submitted_url(submitted, &stored.url),
         no_proxy: validate_no_proxy(&no_proxy)?,
     };
     if config.mode == ProxyMode::Manual {
@@ -423,8 +450,8 @@ fn confirm_apply(app: &tauri::AppHandle) -> bool {
 mod tests {
     use super::{
         env_ops, fingerprint_with, merge_no_proxy, node_env_proxy_ok, redact_proxy_url,
-        validate_no_proxy, validate_proxy_url, InheritedProxy, ProxyConfig, ProxyMode,
-        NO_PROXY_MAX,
+        resolve_submitted_url, validate_no_proxy, validate_proxy_url, InheritedProxy, ProxyConfig,
+        ProxyMode, NO_PROXY_MAX,
     };
 
     #[test]
@@ -598,13 +625,7 @@ mod tests {
             .unwrap();
         assert!(no_proxy.contains("localhost"));
         assert!(no_proxy.contains(last));
-        let no_proxy_lc = ops
-            .iter()
-            .find(|(name, _)| *name == "no_proxy")
-            .and_then(|(_, value)| value.as_deref())
-            .unwrap();
-        assert!(no_proxy_lc.contains("localhost"));
-        assert!(no_proxy_lc.contains(last));
+        assert!(ops.iter().all(|(name, _)| *name != "no_proxy"));
     }
 
     #[test]
@@ -619,6 +640,7 @@ mod tests {
                 http: "http://proxy-a:8080".into(),
                 ..InheritedProxy::default()
             },
+            "22.21.0",
         );
         let second = fingerprint_with(
             &config,
@@ -626,8 +648,13 @@ mod tests {
                 http: "http://proxy-b:8080".into(),
                 ..InheritedProxy::default()
             },
+            "22.21.0",
         );
         assert_ne!(first, second);
+        assert_ne!(
+            fingerprint_with(&config, &InheritedProxy::default(), "20.19.0"),
+            fingerprint_with(&config, &InheritedProxy::default(), "24.0.0")
+        );
         let off = ProxyConfig {
             mode: ProxyMode::Off,
             ..ProxyConfig::default()
@@ -638,14 +665,16 @@ mod tests {
                 &InheritedProxy {
                     http: "http://proxy-a:8080".into(),
                     ..InheritedProxy::default()
-                }
+                },
+                "20.19.0"
             ),
             fingerprint_with(
                 &off,
                 &InheritedProxy {
                     http: "http://proxy-b:8080".into(),
                     ..InheritedProxy::default()
-                }
+                },
+                "24.0.0"
             )
         );
     }
@@ -664,5 +693,24 @@ mod tests {
             redact_proxy_url("http://127.0.0.1:7890"),
             "http://127.0.0.1:7890/"
         );
+    }
+
+    #[test]
+    fn keeps_stored_credentials_when_only_the_host_changes() {
+        let stored = "http://user:secret@old.example:8080";
+        assert_eq!(
+            resolve_submitted_url(&redact_proxy_url(stored), stored),
+            stored
+        );
+        let edited = resolve_submitted_url("http://****:****@new.example:9090", stored);
+        let parsed = tauri::Url::parse(&edited).unwrap();
+        assert_eq!(parsed.username(), "user");
+        assert_eq!(parsed.password(), Some("secret"));
+        assert_eq!(parsed.host_str(), Some("new.example"));
+        assert_eq!(parsed.port(), Some(9090));
+        let replaced = resolve_submitted_url("http://other:newpass@new.example:8080", stored);
+        let parsed = tauri::Url::parse(&replaced).unwrap();
+        assert_eq!(parsed.username(), "other");
+        assert_eq!(parsed.password(), Some("newpass"));
     }
 }
