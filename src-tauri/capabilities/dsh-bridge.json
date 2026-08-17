@@ -8,6 +8,9 @@
   },
   "permissions": [
     "allow-native-web-event",
-    "allow-token-usage"
+    "allow-token-usage",
+    "allow-proxy-config",
+    "allow-set-proxy-config",
+    "allow-restart-dsh"
   ]
 }

@@ -226,7 +226,7 @@ fn sidecar_path() -> Option<PathBuf> {
 
 /// Write via a sibling temp file, then rename. `fs::write` truncates first, so
 /// a crash mid-update would leave an unreadable record and a leaked dsh.
-fn persist_atomic(path: &Path, body: &[u8]) {
+pub(crate) fn persist_atomic(path: &Path, body: &[u8]) {
     let tmp = path.with_extension("tmp");
     if fs::write(&tmp, body).is_err() {
         return;

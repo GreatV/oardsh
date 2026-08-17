@@ -18,6 +18,7 @@ oardsh keeps the familiar dsh Web experience and adds what only a native app can
 - **Native notifications** — a system notification when dsh needs approval, asks a question, or finishes a turn (only if the window is in the background). Click the notification, or the bouncing dock icon, to come back.
 - **Context meter on hover** — the composer's context ring opens its panel on hover rather than a click, and the panel gains each bucket's share of the used context plus the free remainder. dsh's session stats move in there by default, replacing the truncated line under the composer; **Settings → General** puts them back.
 - **Usage statistics** — a dashboard built from local session transcripts: tokens, sessions, messages, active days and current streak over the last 7 or 30 days, a year-long activity heatmap, a daily token trend stacked by model, and each model's share.
+- **Network proxy** — **Settings → General** can send dsh's API and tool traffic through an HTTP proxy. Off ignores inherited `HTTP_PROXY`; System keeps it; Manual sets a URL. Apply restarts the server.
 
 ## Download
 

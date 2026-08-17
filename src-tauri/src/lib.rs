@@ -1,6 +1,7 @@
 mod engine;
 mod i18n;
 mod paths;
+mod proxy;
 mod ready;
 mod sidecar;
 mod usage;
@@ -31,6 +32,8 @@ pub fn run() {
             engine::dsh_status,
             engine::native_web_event,
             engine::restart_dsh,
+            proxy::proxy_config,
+            proxy::set_proxy_config,
             usage::token_usage,
         ])
         .setup(|app| {

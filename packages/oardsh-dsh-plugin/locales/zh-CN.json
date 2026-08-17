@@ -33,5 +33,14 @@
   "statsPlacement.title": "会话统计显示位置",
   "statsPlacement.help": "由 oardsh 提供：把输入框下方那行统计文本收进上下文圆环的悬浮面板。",
   "statsPlacement.ring": "上下文圆环",
-  "statsPlacement.dsh": "dsh 默认"
+  "statsPlacement.dsh": "dsh 默认",
+  "proxy.title": "网络代理",
+  "proxy.help": "由 oardsh 提供：让 dsh 的 API 与工具流量走代理。应用后会重启服务。本机回环地址不会走代理。",
+  "proxy.mode.off": "关闭",
+  "proxy.mode.system": "系统",
+  "proxy.mode.manual": "手动",
+  "proxy.url": "代理地址",
+  "proxy.noProxy": "不走代理的主机（逗号分隔）",
+  "proxy.apply": "应用并重启",
+  "proxy.applying": "正在重启…"
 }

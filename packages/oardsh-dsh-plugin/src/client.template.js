@@ -85,6 +85,7 @@ window.__ModuleLoader__.load({
       .oardsh-mark{display:inline-block;width:14px;height:14px;flex:none;background:currentColor;-webkit-mask:url("${MARK}") center/contain no-repeat;mask:url("${MARK}") center/contain no-repeat}
       .oardsh-brand{display:flex;align-items:center;gap:7px}.oardsh-brand .oardsh-mark{width:16px;height:16px;color:var(--dsw-alias-label-secondary)}
       .oardsh-general-row{display:flex;align-items:center;gap:10px;padding:16px 0;border-bottom:1px solid var(--dsw-alias-border-l2)}.oardsh-general-row .oardsh-mark{color:var(--dsw-alias-label-tertiary)}.oardsh-general-text{flex:1;min-width:0;padding-right:24px;display:flex;flex-direction:column;gap:2px}.oardsh-general-title{color:var(--dsw-alias-label-primary);font-size:14px;line-height:22px}.oardsh-general-help{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
+      .oardsh-general-stack{align-items:flex-start}.oardsh-general-stack .oardsh-general-text{padding-right:0;width:100%}.oardsh-general-fields{display:flex;flex-direction:column;gap:8px;margin-top:10px;max-width:420px}.oardsh-field{display:flex;flex-direction:column;gap:4px}.oardsh-field span{font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}.oardsh-input{box-sizing:border-box;height:30px;width:100%;border:1px solid var(--dsw-alias-border-l2);background:transparent;color:var(--dsw-alias-label-primary);border-radius:8px;padding:0 10px;font:inherit;font-size:12px}.oardsh-input:focus{outline:none;border-color:var(--dsw-alias-border-l1,var(--dsw-alias-label-tertiary))}.oardsh-general-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
       .oardsh-ctx-brand{display:flex;align-items:center;gap:5px;color:var(--dsw-alias-label-caption);font-size:11px;line-height:16px;margin-bottom:2px}.oardsh-ctx-brand .oardsh-mark{width:11px;height:11px}
       .oardsh-ctx-share{color:var(--dsw-alias-label-tertiary);font-weight:400}
       .oardsh-ctx-swatch{background:var(--meter-tint,var(--dsw-alias-label-tertiary));vertical-align:baseline;border-radius:2px;width:8px;height:8px;margin-right:6px;display:inline-block}
@@ -503,6 +504,67 @@ window.__ModuleLoader__.load({
         }, t(value ? "statsPlacement.ring" : "statsPlacement.dsh")))));
     }
 
+    function ProxyRow({ t }) {
+      const native = typeof window.__TAURI_INTERNALS__?.invoke === "function";
+      const [mode, setMode] = useState("system");
+      const [url, setUrl] = useState("");
+      const [noProxy, setNoProxy] = useState("");
+      const [saved, setSaved] = useState(null);
+      const [error, setError] = useState("");
+      const [busy, setBusy] = useState(false);
+      useEffect(() => {
+        if (!native) return;
+        invoke("proxy_config").then((config) => {
+          setMode(config.mode);
+          setUrl(config.url || "");
+          setNoProxy(config.noProxy || "");
+          setSaved(config);
+        }).catch((reason) => setError(String(reason).replace(/^Error:\s*/, "")));
+      }, [native]);
+      const dirty = !saved || saved.mode !== mode || (saved.url || "") !== url || (saved.noProxy || "") !== noProxy;
+      const apply = async () => {
+        setBusy(true);
+        setError("");
+        try {
+          const config = await invoke("set_proxy_config", { mode, url, noProxy });
+          setSaved(config);
+          await invoke("restart_dsh");
+        } catch (reason) {
+          setError(String(reason).replace(/^Error:\s*/, ""));
+        } finally {
+          setBusy(false);
+        }
+      };
+      return h("div", { className: "oardsh-general-row oardsh-general-stack" },
+        h("span", { className: "oardsh-mark", "aria-hidden": true, title: "oardsh" }),
+        h("div", { className: "oardsh-general-text" },
+          h("div", { className: "oardsh-general-title" }, t("proxy.title")),
+          h("div", { className: "oardsh-general-help" }, native ? t("proxy.help") : t("unavailable")),
+          native && h("div", { className: "oardsh-general-fields" },
+            h("div", { className: "oardsh-switch" }, ["off", "system", "manual"].map((value) => h("button", {
+              type: "button", key: value, "data-active": mode === value || undefined,
+              onClick: () => setMode(value),
+            }, t(`proxy.mode.${value}`)))),
+            mode === "manual" && h("label", { className: "oardsh-field" },
+              h("span", null, t("proxy.url")),
+              h("input", {
+                className: "oardsh-input", type: "url", spellCheck: false, autoComplete: "off",
+                placeholder: "http://127.0.0.1:7890", value: url,
+                onChange: (event) => setUrl(event.target.value),
+              })),
+            mode === "manual" && h("label", { className: "oardsh-field" },
+              h("span", null, t("proxy.noProxy")),
+              h("input", {
+                className: "oardsh-input", type: "text", spellCheck: false, autoComplete: "off",
+                placeholder: "example.com,.corp.local", value: noProxy,
+                onChange: (event) => setNoProxy(event.target.value),
+              })),
+            h("div", { className: "oardsh-general-actions" },
+              h("button", { type: "button", className: "oardsh-button", disabled: busy || !dirty, onClick: apply },
+                busy ? t("proxy.applying") : t("proxy.apply"))),
+            error && h("div", { className: "oardsh-error" }, error))));
+    }
+
     function UsageSection({ t }) {
       const [range, setRange] = useState(30);
       const [report, setReport] = useState(null);
@@ -652,6 +714,7 @@ window.__ModuleLoader__.load({
       }, "oardsh: session stats placement");
       ctx.slots.inject("settings.section", () => ctx.slots.register({ name: "settings.section", id: "oardsh-desktop", order: 30, label: () => t("nav") }, () => h(UsageSection, { t })));
       ctx.slots.inject("settings.general.item", () => ctx.slots.register({ name: "settings.general.item", id: "oardsh-stats-placement", order: 60 }, () => h(StatsPlacementRow, { t })));
+      ctx.slots.inject("settings.general.item", () => ctx.slots.register({ name: "settings.general.item", id: "oardsh-proxy", order: 70 }, () => h(ProxyRow, { t })));
       ctx.effect(() => {
         let ring = null;
         let root = null;

@@ -33,5 +33,14 @@
   "statsPlacement.title": "Session stats placement",
   "statsPlacement.help": "Provided by oardsh: fold the stats line under the composer into the context ring's hover panel.",
   "statsPlacement.ring": "Context ring",
-  "statsPlacement.dsh": "dsh default"
+  "statsPlacement.dsh": "dsh default",
+  "proxy.title": "Network proxy",
+  "proxy.help": "Provided by oardsh: send dsh API and tool traffic through a proxy. Apply restarts the server. Loopback addresses are never proxied.",
+  "proxy.mode.off": "Off",
+  "proxy.mode.system": "System",
+  "proxy.mode.manual": "Manual",
+  "proxy.url": "Proxy URL",
+  "proxy.noProxy": "Skip these hosts (comma-separated)",
+  "proxy.apply": "Apply and restart",
+  "proxy.applying": "Restarting…"
 }

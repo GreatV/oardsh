@@ -15,6 +15,7 @@ use tauri_plugin_notification::NotificationExt;
 
 use crate::i18n;
 use crate::paths;
+use crate::proxy;
 use crate::ready;
 use crate::sidecar;
 
@@ -962,6 +963,7 @@ pub(crate) fn configure_command(app: &AppHandle, command: &mut Command, workspac
     if let Some(home) = paths::resolve_dsh_home() {
         command.env("DSH_HOME", home);
     }
+    proxy::apply(command);
     command
         .env("NPM_CONFIG_YES", "true")
         .env("NPM_CONFIG_UPDATE_NOTIFIER", "false")
