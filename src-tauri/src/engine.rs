@@ -783,6 +783,7 @@ pub fn clear_attention(app: &AppHandle) {
 }
 
 fn show_clickable_notification(app: &AppHandle, title: &str, body: &str) {
+    #[cfg(any(target_os = "macos", windows))]
     let identifier = app.config().identifier.clone();
     let title = title.to_string();
     let body = body.to_string();
