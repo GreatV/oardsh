@@ -217,6 +217,9 @@ fn validate_proxy_url(raw: &str) -> Result<String, String> {
     if trimmed.is_empty() {
         return Err("A proxy URL is required".into());
     }
+    if trimmed.contains('\0') {
+        return Err("Proxy URL is not valid".into());
+    }
     if trimmed.len() > 512 {
         return Err("Proxy URL is too long".into());
     }
@@ -248,6 +251,9 @@ fn redact_proxy_url(raw: &str) -> String {
     let Ok(mut parsed) = tauri::Url::parse(raw.trim()) else {
         return raw.to_string();
     };
+    if !parsed.username().is_empty() {
+        let _ = parsed.set_username("****");
+    }
     if parsed.password().is_some() {
         let _ = parsed.set_password(Some("****"));
     }
@@ -272,6 +278,9 @@ pub fn proxy_config(app: tauri::AppHandle) -> ProxyView {
 
 fn validate_no_proxy(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
+    if trimmed.contains('\0') {
+        return Err("The no-proxy list is not valid".into());
+    }
     if trimmed.len() > NO_PROXY_MAX {
         return Err("The no-proxy list is too long".into());
     }
@@ -319,6 +328,9 @@ pub fn set_proxy_config(
 ) -> Result<ProxyView, String> {
     let stored = load();
     let submitted = url.trim();
+    if submitted.contains('\0') {
+        return Err("Proxy URL is not valid".into());
+    }
     if submitted.len() > 512 {
         return Err("Proxy URL is too long".into());
     }
@@ -376,6 +388,7 @@ mod tests {
             "http://127.0.0.1:7890"
         );
         assert!(validate_proxy_url("http://user:pass@127.0.0.1:7890").is_ok());
+        assert!(validate_proxy_url("http://127.0.0.1:7890\0").is_err());
     }
 
     #[test]
@@ -391,6 +404,7 @@ mod tests {
     fn rejects_an_oversized_no_proxy_list() {
         assert!(validate_no_proxy("corp.local").is_ok());
         assert!(validate_no_proxy(&"a".repeat(NO_PROXY_MAX + 1)).is_err());
+        assert!(validate_no_proxy("corp.local\0.internal").is_err());
     }
 
     #[test]
@@ -580,10 +594,14 @@ mod tests {
     }
 
     #[test]
-    fn redacts_proxy_passwords() {
+    fn redacts_proxy_userinfo() {
         assert_eq!(
             redact_proxy_url("http://user:secret@127.0.0.1:7890"),
-            "http://user:****@127.0.0.1:7890/"
+            "http://****:****@127.0.0.1:7890/"
+        );
+        assert_eq!(
+            redact_proxy_url("http://TOKEN@127.0.0.1:7890"),
+            "http://****@127.0.0.1:7890/"
         );
         assert_eq!(
             redact_proxy_url("http://127.0.0.1:7890"),
