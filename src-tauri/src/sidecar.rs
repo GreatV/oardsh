@@ -21,9 +21,11 @@ struct Record {
     entry: String,
     #[serde(default)]
     url: Option<String>,
+    #[serde(default)]
+    proxy: Option<String>,
 }
 
-pub fn write(pid: u32, entry: &Path, url: Option<&str>) {
+pub fn write(pid: u32, entry: &Path, url: Option<&str>, proxy: Option<&str>) {
     let Some(path) = sidecar_path() else {
         return;
     };
@@ -34,9 +36,10 @@ pub fn write(pid: u32, entry: &Path, url: Option<&str>) {
         pid,
         entry: entry.display().to_string(),
         url: url.map(str::to_string),
+        proxy: proxy.map(str::to_string),
     };
     if let Ok(body) = serde_json::to_string(&record) {
-        persist_atomic(&path, body.as_bytes());
+        let _ = persist_atomic(&path, body.as_bytes());
     }
 }
 
@@ -44,6 +47,7 @@ pub fn update_url(url: &str) {
     let Some(path) = sidecar_path() else {
         return;
     };
+    recover_backup(&path);
     let Ok(body) = fs::read_to_string(&path) else {
         return;
     };
@@ -52,7 +56,7 @@ pub fn update_url(url: &str) {
     };
     record.url = Some(url.to_string());
     if let Ok(next) = serde_json::to_string(&record) {
-        persist_atomic(&path, next.as_bytes());
+        let _ = persist_atomic(&path, next.as_bytes());
     }
 }
 
@@ -83,11 +87,20 @@ pub fn mark_tray_hint_seen() {
 /// If a leftover process is ours and still serving, return it so the engine
 /// can attach. If it is ours but not serving, kill only that process. A live
 /// process whose command line is not our entry is left alone.
-pub fn recover_ours(ready: impl Fn(&str) -> bool) -> Option<(u32, PathBuf, String)> {
+pub fn recover_ours(
+    ready: impl Fn(&str) -> bool,
+    expected_proxy: &str,
+) -> Option<(u32, PathBuf, String)> {
     let path = sidecar_path()?;
+    recover_backup(&path);
     let body = fs::read_to_string(&path).ok()?;
     let record = serde_json::from_str::<Record>(&body).ok()?;
     let entry = PathBuf::from(&record.entry);
+    if record.proxy.as_deref() != Some(expected_proxy) {
+        kill_if_ours(record.pid, &entry);
+        let _ = fs::remove_file(&path);
+        return None;
+    }
     if !pid_alive(record.pid) {
         let _ = fs::remove_file(path);
         return None;
@@ -224,20 +237,62 @@ fn sidecar_path() -> Option<PathBuf> {
     paths::resolve_dsh_home().map(|home| PathBuf::from(home).join("oardsh.sidecar.json"))
 }
 
+pub(crate) fn recover_backup(path: &Path) {
+    if path.is_file() {
+        return;
+    }
+    let bak = path.with_extension("bak");
+    if bak.is_file() {
+        let _ = fs::rename(&bak, path);
+    }
+}
+
 /// Write via a sibling temp file, then rename. `fs::write` truncates first, so
 /// a crash mid-update would leave an unreadable record and a leaked dsh.
-fn persist_atomic(path: &Path, body: &[u8]) {
+pub(crate) fn persist_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    recover_backup(path);
     let tmp = path.with_extension("tmp");
-    if fs::write(&tmp, body).is_err() {
-        return;
-    }
+    write_private(&tmp, body)?;
     if fs::rename(&tmp, path).is_ok() {
-        return;
+        return Ok(());
     }
-    // Windows cannot rename over an existing file.
-    let _ = fs::remove_file(path);
-    if fs::rename(&tmp, path).is_err() {
-        let _ = fs::remove_file(&tmp);
+    // Windows cannot rename over an existing file. Move the old file aside
+    // first so a failed second rename can put it back.
+    let bak = path.with_extension("bak");
+    let _ = fs::remove_file(&bak);
+    fs::rename(path, &bak)?;
+    match fs::rename(&tmp, path) {
+        Ok(()) => {
+            let _ = fs::remove_file(&bak);
+            Ok(())
+        }
+        Err(err) => {
+            let _ = fs::rename(&bak, path);
+            let _ = fs::remove_file(&tmp);
+            Err(err)
+        }
+    }
+}
+
+fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(body)?;
+        file.sync_all()?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, body)
     }
 }
 
@@ -259,7 +314,7 @@ fn is_loopback_server(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{cmdline_owns_entry, is_loopback_server, persist_atomic, Record};
+    use super::{cmdline_owns_entry, is_loopback_server, persist_atomic, recover_backup, Record};
     use std::fs;
 
     #[test]
@@ -293,12 +348,14 @@ mod tests {
             pid: 4242,
             entry: "/opt/dsh/lib/bin.js".into(),
             url: Some("http://127.0.0.1:41234".into()),
+            proxy: Some("system||".into()),
         };
         let body = serde_json::to_string(&record).unwrap();
         let parsed: Record = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed, record);
         let legacy: Record = serde_json::from_str(r#"{"pid":1,"entry":"/dsh.js"}"#).unwrap();
         assert_eq!(legacy.url, None);
+        assert_eq!(legacy.proxy, None);
     }
 
     #[test]
@@ -313,12 +370,32 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("oardsh.sidecar.json");
-        persist_atomic(&path, br#"{"pid":1,"entry":"/old.js"}"#);
-        persist_atomic(&path, br#"{"pid":2,"entry":"/new.js"}"#);
+        persist_atomic(&path, br#"{"pid":1,"entry":"/old.js"}"#).unwrap();
+        persist_atomic(&path, br#"{"pid":2,"entry":"/new.js"}"#).unwrap();
         let body = fs::read_to_string(&path).unwrap();
         let parsed: Record = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed.pid, 2);
         assert_eq!(parsed.entry, "/new.js");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recover_backup_restores_a_missing_primary() {
+        let dir = std::env::temp_dir().join(format!(
+            "oardsh-bak-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("oardsh.proxy.json");
+        let bak = path.with_extension("bak");
+        fs::write(&bak, br#"{"mode":"off"}"#).unwrap();
+        recover_backup(&path);
+        assert_eq!(fs::read_to_string(&path).unwrap(), r#"{"mode":"off"}"#);
+        assert!(!bak.exists());
         let _ = fs::remove_dir_all(dir);
     }
 }

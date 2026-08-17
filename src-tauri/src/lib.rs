@@ -1,6 +1,7 @@
 mod engine;
 mod i18n;
 mod paths;
+mod proxy;
 mod ready;
 mod sidecar;
 mod usage;
@@ -26,11 +27,14 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(Engine::new())
         .invoke_handler(tauri::generate_handler![
             engine::dsh_status,
             engine::native_web_event,
             engine::restart_dsh,
+            proxy::proxy_config,
+            proxy::set_proxy_config,
             usage::token_usage,
         ])
         .setup(|app| {

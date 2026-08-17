@@ -6,6 +6,8 @@ const COMMANDS: &[&str] = &[
     "dsh_status",
     "native_web_event",
     "restart_dsh",
+    "proxy_config",
+    "set_proxy_config",
     "token_usage",
 ];
 
