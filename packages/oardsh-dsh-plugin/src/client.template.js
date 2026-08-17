@@ -562,6 +562,7 @@ window.__ModuleLoader__.load({
             h("div", { className: "oardsh-general-actions" },
               h("button", { type: "button", className: "oardsh-button", disabled: busy || !saved || !dirty, onClick: apply },
                 busy ? t("proxy.applying") : t("proxy.apply"))),
+            saved && !saved.fetchProxy && mode !== "off" && h("div", { className: "oardsh-general-help" }, t("proxy.fetchHint")),
             error && h("div", { className: "oardsh-error" }, error))));
     }
 

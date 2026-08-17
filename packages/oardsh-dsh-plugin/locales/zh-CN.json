@@ -42,5 +42,6 @@
   "proxy.url": "代理地址",
   "proxy.noProxy": "不走代理的主机（逗号分隔）",
   "proxy.apply": "应用并重启",
-  "proxy.applying": "正在重启…"
+  "proxy.applying": "正在重启…",
+  "proxy.fetchHint": "当前 Node 不会把 dsh 的 API 请求送进代理。请使用 Node 22.21 或打包版 oardsh。读取 HTTP_PROXY 的工具仍会走代理。"
 }

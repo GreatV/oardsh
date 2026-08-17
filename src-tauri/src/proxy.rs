@@ -40,11 +40,29 @@ pub struct ProxyConfig {
     pub no_proxy: String,
 }
 
+#[derive(Debug, Clone, Default)]
+struct InheritedProxy {
+    http: String,
+    https: String,
+    all: String,
+    no_proxy: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyView {
+    #[serde(flatten)]
+    pub config: ProxyConfig,
+    /// Node `fetch` honors `NODE_USE_ENV_PROXY` only on 22.21+ / 24+.
+    pub fetch_proxy: bool,
+}
+
 /// Saved config. Missing or unreadable file means inherit the process env.
 pub fn load() -> ProxyConfig {
     let Some(path) = config_path() else {
         return ProxyConfig::default();
     };
+    sidecar::recover_backup(&path);
     let Ok(body) = std::fs::read_to_string(path) else {
         return ProxyConfig::default();
     };
@@ -52,14 +70,14 @@ pub fn load() -> ProxyConfig {
 }
 
 pub fn apply(command: &mut Command) {
-    apply_ops(command, &env_ops(&load(), inherited_no_proxy()));
+    apply_ops(command, &env_ops(&load(), &inherited_proxy()));
 }
 
 /// Env mutations for the dsh child. `None` unsets the variable so a saved
 /// Off cannot inherit a proxy from the oardsh process.
 fn env_ops(
     config: &ProxyConfig,
-    inherited_no_proxy: String,
+    inherited: &InheritedProxy,
 ) -> Vec<(&'static str, Option<String>)> {
     match config.mode {
         ProxyMode::Off => PROXY_VARS
@@ -68,11 +86,24 @@ fn env_ops(
             .map(|name| (name, None))
             .chain(std::iter::once(("NODE_USE_ENV_PROXY", None)))
             .collect(),
-        ProxyMode::System => vec![
-            ("NODE_USE_ENV_PROXY", Some("1".into())),
-            ("NO_PROXY", Some(merge_no_proxy(&inherited_no_proxy))),
-            ("no_proxy", Some(merge_no_proxy(&inherited_no_proxy))),
-        ],
+        ProxyMode::System => {
+            let no_proxy = merge_no_proxy(&inherited.no_proxy);
+            let mut ops = vec![
+                ("NODE_USE_ENV_PROXY", Some("1".into())),
+                ("NO_PROXY", Some(no_proxy.clone())),
+                ("no_proxy", Some(no_proxy)),
+            ];
+            // Node's env-proxy reads HTTP(S)_PROXY, not ALL_PROXY.
+            if inherited.http.is_empty() && inherited.https.is_empty() && !inherited.all.is_empty()
+            {
+                let url = inherited.all.clone();
+                ops.push(("HTTP_PROXY", Some(url.clone())));
+                ops.push(("HTTPS_PROXY", Some(url.clone())));
+                ops.push(("http_proxy", Some(url.clone())));
+                ops.push(("https_proxy", Some(url)));
+            }
+            ops
+        }
         ProxyMode::Manual => {
             let url = config.url.trim().to_string();
             let no_proxy = merge_no_proxy(&config.no_proxy);
@@ -104,16 +135,33 @@ fn apply_ops(command: &mut Command, ops: &[(&str, Option<String>)]) {
     }
 }
 
-fn inherited_no_proxy() -> String {
-    let upper = env::var("NO_PROXY").unwrap_or_default();
-    let lower = env::var("no_proxy").unwrap_or_default();
-    if upper.is_empty() {
-        return lower;
+fn first_env(names: &[&str]) -> String {
+    for name in names {
+        if let Ok(value) = env::var(name) {
+            if !value.trim().is_empty() {
+                return value;
+            }
+        }
     }
-    if lower.is_empty() {
-        return upper;
+    String::new()
+}
+
+fn inherited_proxy() -> InheritedProxy {
+    let no_upper = env::var("NO_PROXY").unwrap_or_default();
+    let no_lower = env::var("no_proxy").unwrap_or_default();
+    let no_proxy = if no_upper.is_empty() {
+        no_lower
+    } else if no_lower.is_empty() {
+        no_upper
+    } else {
+        format!("{no_upper},{no_lower}")
+    };
+    InheritedProxy {
+        http: first_env(&["HTTP_PROXY", "http_proxy"]),
+        https: first_env(&["HTTPS_PROXY", "https_proxy"]),
+        all: first_env(&["ALL_PROXY", "all_proxy"]),
+        no_proxy,
     }
-    format!("{upper},{lower}")
 }
 
 fn merge_no_proxy(user: &str) -> String {
@@ -165,9 +213,16 @@ fn config_path() -> Option<std::path::PathBuf> {
     paths::resolve_dsh_home().map(|home| std::path::PathBuf::from(home).join("oardsh.proxy.json"))
 }
 
+fn view(app: &tauri::AppHandle, config: ProxyConfig) -> ProxyView {
+    ProxyView {
+        config,
+        fetch_proxy: node_supports_env_proxy(app),
+    }
+}
+
 #[tauri::command]
-pub fn proxy_config() -> ProxyConfig {
-    load()
+pub fn proxy_config(app: tauri::AppHandle) -> ProxyView {
+    view(&app, load())
 }
 
 fn validate_no_proxy(raw: &str) -> Result<String, String> {
@@ -212,7 +267,7 @@ pub fn set_proxy_config(
     mode: ProxyMode,
     url: String,
     no_proxy: String,
-) -> Result<ProxyConfig, String> {
+) -> Result<ProxyView, String> {
     let mut config = ProxyConfig {
         mode,
         url: url.trim().to_string(),
@@ -227,14 +282,14 @@ pub fn set_proxy_config(
         }
     }
     save(&config)?;
-    Ok(config)
+    Ok(view(&app, config))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         env_ops, merge_no_proxy, node_env_proxy_ok, validate_no_proxy, validate_proxy_url,
-        ProxyConfig, ProxyMode, NO_PROXY_MAX,
+        InheritedProxy, ProxyConfig, ProxyMode, NO_PROXY_MAX,
     };
 
     #[test]
@@ -282,7 +337,7 @@ mod tests {
                 mode: ProxyMode::Off,
                 ..ProxyConfig::default()
             },
-            String::new(),
+            &InheritedProxy::default(),
         );
         assert!(ops
             .iter()
@@ -300,7 +355,7 @@ mod tests {
                 url: "http://127.0.0.1:7890".into(),
                 no_proxy: "corp.local".into(),
             },
-            String::new(),
+            &InheritedProxy::default(),
         );
         let https = ops
             .iter()
@@ -320,5 +375,45 @@ mod tests {
                 .and_then(|(_, value)| value.as_deref()),
             Some("1")
         );
+    }
+
+    #[test]
+    fn system_maps_all_proxy_when_protocol_vars_are_absent() {
+        let ops = env_ops(
+            &ProxyConfig {
+                mode: ProxyMode::System,
+                ..ProxyConfig::default()
+            },
+            &InheritedProxy {
+                all: "http://127.0.0.1:7890".into(),
+                ..InheritedProxy::default()
+            },
+        );
+        let https = ops
+            .iter()
+            .find(|(name, _)| *name == "HTTPS_PROXY")
+            .and_then(|(_, value)| value.as_deref());
+        assert_eq!(https, Some("http://127.0.0.1:7890"));
+        let http = ops
+            .iter()
+            .find(|(name, _)| *name == "HTTP_PROXY")
+            .and_then(|(_, value)| value.as_deref());
+        assert_eq!(http, Some("http://127.0.0.1:7890"));
+    }
+
+    #[test]
+    fn system_leaves_http_proxy_alone_when_already_set() {
+        let ops = env_ops(
+            &ProxyConfig {
+                mode: ProxyMode::System,
+                ..ProxyConfig::default()
+            },
+            &InheritedProxy {
+                http: "http://already:8080".into(),
+                all: "http://127.0.0.1:7890".into(),
+                ..InheritedProxy::default()
+            },
+        );
+        assert!(ops.iter().all(|(name, _)| *name != "HTTP_PROXY"));
     }
 }

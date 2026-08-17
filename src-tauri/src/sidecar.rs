@@ -224,9 +224,20 @@ fn sidecar_path() -> Option<PathBuf> {
     paths::resolve_dsh_home().map(|home| PathBuf::from(home).join("oardsh.sidecar.json"))
 }
 
+pub(crate) fn recover_backup(path: &Path) {
+    if path.is_file() {
+        return;
+    }
+    let bak = path.with_extension("bak");
+    if bak.is_file() {
+        let _ = fs::rename(&bak, path);
+    }
+}
+
 /// Write via a sibling temp file, then rename. `fs::write` truncates first, so
 /// a crash mid-update would leave an unreadable record and a leaked dsh.
 pub(crate) fn persist_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    recover_backup(path);
     let tmp = path.with_extension("tmp");
     write_private(&tmp, body)?;
     if fs::rename(&tmp, path).is_ok() {
@@ -290,7 +301,7 @@ fn is_loopback_server(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{cmdline_owns_entry, is_loopback_server, persist_atomic, Record};
+    use super::{cmdline_owns_entry, is_loopback_server, persist_atomic, recover_backup, Record};
     use std::fs;
 
     #[test]
@@ -350,6 +361,26 @@ mod tests {
         let parsed: Record = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed.pid, 2);
         assert_eq!(parsed.entry, "/new.js");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recover_backup_restores_a_missing_primary() {
+        let dir = std::env::temp_dir().join(format!(
+            "oardsh-bak-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("oardsh.proxy.json");
+        let bak = path.with_extension("bak");
+        fs::write(&bak, br#"{"mode":"off"}"#).unwrap();
+        recover_backup(&path);
+        assert_eq!(fs::read_to_string(&path).unwrap(), r#"{"mode":"off"}"#);
+        assert!(!bak.exists());
         let _ = fs::remove_dir_all(dir);
     }
 }

@@ -42,5 +42,6 @@
   "proxy.url": "Proxy URL",
   "proxy.noProxy": "Skip these hosts (comma-separated)",
   "proxy.apply": "Apply and restart",
-  "proxy.applying": "Restarting…"
+  "proxy.applying": "Restarting…",
+  "proxy.fetchHint": "This Node build will not send dsh API calls through the proxy. Use Node 22.21+ or packaged oardsh. Tools that read HTTP_PROXY still will."
 }
