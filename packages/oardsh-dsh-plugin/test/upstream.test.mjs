@@ -14,22 +14,22 @@ import { describe, it } from "node:test";
 const require = createRequire(import.meta.url);
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 
-/// npm may hoist the conversation UI to the top or nest it under dsh.
-const CANDIDATES = [
-  "node_modules/@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
-  "node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
-];
-
-function conversationClient() {
-  for (const candidate of CANDIDATES) {
+/// npm may hoist a UI package to the top or nest it under dsh or dsh-web-app.
+function dshClient(name) {
+  const candidates = [
+    `node_modules/@deepseek-ai/${name}/lib/client.js`,
+    `node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/${name}/lib/client.js`,
+    `node_modules/@deepseek-ai/dsh-web-app/node_modules/@deepseek-ai/${name}/lib/client.js`,
+  ];
+  for (const candidate of candidates) {
     const path = join(root, candidate);
     if (existsSync(path)) return readFileSync(path, "utf8");
   }
-  throw new Error(`dsh's conversation UI was not found; looked in:\n  ${CANDIDATES.join("\n  ")}`);
+  throw new Error(`dsh's ${name} client was not found; looked in:\n  ${candidates.join("\n  ")}`);
 }
 
 describe("the dsh this build injects into", () => {
-  const source = conversationClient();
+  const source = dshClient("dsh-client-ui-conversation");
 
   it("is the release the plugin was written against", () => {
     const installed = require("@deepseek-ai/dsh/package.json").version;

@@ -66,24 +66,6 @@ pub fn clear() {
     }
 }
 
-fn tray_hint_path() -> Option<PathBuf> {
-    paths::resolve_dsh_home().map(|home| PathBuf::from(home).join("oardsh.tray-hint"))
-}
-
-pub fn tray_hint_seen() -> bool {
-    tray_hint_path().is_some_and(|path| path.is_file())
-}
-
-pub fn mark_tray_hint_seen() {
-    let Some(path) = tray_hint_path() else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let _ = fs::write(path, "1\n");
-}
-
 /// If a leftover process is ours and still serving, return it so the engine
 /// can attach. If it is ours but not serving, kill only that process. A live
 /// process whose command line is not our entry is left alone.

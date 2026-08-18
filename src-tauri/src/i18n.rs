@@ -88,19 +88,8 @@ mod tests {
     fn normalizes_and_falls_back() {
         assert_eq!(normalize_locale("zh-Hans-CN"), "zh-CN");
         assert_eq!(normalize_locale("fr-FR"), "en");
-        assert_eq!(
-            translate("en", "notification.completed.title"),
-            "dsh finished the current turn"
-        );
         assert_eq!(translate("zh-CN", "tray.quit"), "退出 oardsh");
-        assert_eq!(
-            translate("en", "notification.crash.title"),
-            "dsh stopped unexpectedly"
-        );
         assert_eq!(translate("zh-CN", "menu.file"), "文件");
-        assert_eq!(
-            translate("en", "notification.tray.title"),
-            "oardsh is still running"
-        );
+        assert_eq!(translate("en", "tray.tooltip.ready"), "oardsh — ready");
     }
 }
