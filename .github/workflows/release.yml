@@ -23,7 +23,11 @@ jobs:
           - name: macOS Intel
             platform: macos-26-intel
             target: x86_64-apple-darwin
-            args: --target x86_64-apple-darwin
+            # bundle_dmg.sh fails deterministically on the macos-26-intel image
+            # (4/4 runs, ~10 min inside hdiutil; the ARM image bundles the same
+            # app fine). Ship the .app tarball until prepare-runtime learns to
+            # cross-compile, which is what a dmg from the ARM runner would need.
+            args: --target x86_64-apple-darwin --bundles app
           - name: Linux x64
             platform: ubuntu-22.04
             target: ""
