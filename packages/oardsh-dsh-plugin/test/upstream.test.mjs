@@ -29,7 +29,8 @@ function dshClient(name) {
 }
 
 describe("the dsh this build injects into", () => {
-  const source = dshClient("dsh-client-ui-conversation");
+  const conversation = dshClient("dsh-client-ui-conversation");
+  const chat = dshClient("dsh-client-ui-chat");
 
   it("is the release the plugin was written against", () => {
     const installed = require("@deepseek-ai/dsh/package.json").version;
@@ -46,30 +47,33 @@ describe("the dsh this build injects into", () => {
 
   /// Each entry is one thing the plugin reaches for, named the way the runtime
   /// guardrail names it, so a failure here and a warning in the app read alike.
+  /// The context meter lives in dsh-client-ui-conversation; the session stats
+  /// moved to dsh-client-ui-chat's StatsPills.
   const CONTRACTS = [
-    ["context.ring", /viewBox: "0 0 14 14"/, "the 14px gauge the hover-open effect recognises"],
-    ["context.ring", /"aria-haspopup": "dialog"/, "the gauge sits behind a dialog trigger"],
-    ["context.ring", /ContextMeter_module_css_default\.track/, "gauge circle 1 of 2: the track"],
-    ["context.ring", /ContextMeter_module_css_default\.fill/, "gauge circle 2 of 2: the fill the arcs replace"],
-    ["context.panel", /role: "dialog"/, "the panel the extras are written into"],
-    ["context.buckets", /ContextMeter_module_css_default\.rows/, "the dl of per-bucket readings"],
-    ["context.figures", /formatTokens\(context\.usedTokens\)/, "the `~used / total` figure the free row is derived from"],
-    ["context.bar", /ContextMeter_module_css_default\.segment/, "the stacked bar the ring is tinted from"],
-    ["stats.strip", /children: "\|"/, "the aria-hidden separator the stats line is found by"],
+    [conversation, "context.ring", /viewBox: "0 0 14 14"/, "the 14px gauge the hover-open effect recognises"],
+    [conversation, "context.ring", /"aria-haspopup": "dialog"/, "the gauge sits behind a dialog trigger"],
+    [conversation, "context.ring", /ContextMeter_module_css_default\.track/, "gauge circle 1 of 2: the track"],
+    [conversation, "context.ring", /ContextMeter_module_css_default\.fill/, "gauge circle 2 of 2: the fill the arcs replace"],
+    [conversation, "context.panel", /role: "dialog"/, "the panel the extras are written into"],
+    [conversation, "context.buckets", /ContextMeter_module_css_default\.rows/, "the dl of per-bucket readings"],
+    [conversation, "context.figures", /formatTokens\(context\.usedTokens, t\)/, "the `~used / total` figure the free row is derived from"],
+    [conversation, "context.bar", /ContextMeter_module_css_default\.segment/, "the stacked bar the ring is tinted from"],
+    [chat, "stats.strip", /"data-composer-stats": true/, "the pills row the session stats are found by"],
+    [chat, "stats.strip", /children: "·"/, "the aria-hidden middot a pill joins its readings with"],
   ];
 
-  for (const [id, pattern, what] of CONTRACTS) {
+  for (const [source, id, pattern, what] of CONTRACTS) {
     it(`still renders ${what} (${id})`, () => {
       assert.match(source, pattern);
     });
   }
 
-  /// The splitter turns each of these into a term and a reading. A new group
+  /// The splitter turns each pill's label into terms and readings. A new group
   /// shape is not a break - it falls back to a full-width line - but it is a
   /// reason to look, so the list is asserted rather than assumed.
   it("still writes its stats as the groups the splitter reads", () => {
-    for (const key of ["stats.counts", "stats.llm", "stats.toolCall", "stats.tokensPerSecond", "stats.cacheHit", "stats.tokens"]) {
-      assert.match(source, new RegExp(`"${key.replace(".", "\\.")}":`), `${key} is gone from dsh's stats line`);
+    for (const key of ["stats.counts", "message.tokensPerSecond", "message.turnUsage.count", "stats.cacheHit"]) {
+      assert.match(chat, new RegExp(`"${key.replaceAll(".", "\\.")}":`), `${key} is gone from dsh's stats pills`);
     }
   });
 });

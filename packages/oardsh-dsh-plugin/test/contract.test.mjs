@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { after, describe, it } from "node:test";
 import { boot, frame, hover, rowsOf } from "./harness.mjs";
-import { BUCKETS, STATS_EN, STATS_ZH, mountContextMeter, mountStatsLine } from "./dsh-fixture.mjs";
+import { BUCKETS, PILLS_EN, PILLS_ZH, mountContextMeter, mountStatsPills } from "./dsh-fixture.mjs";
 
 /**
  * The plugin decorates dsh surfaces that no slot exposes, so the failure to
@@ -22,10 +22,10 @@ async function leave(app) {
   await frame(app.window);
 }
 
-function mount({ locale = "en", stats = STATS_EN } = {}) {
+function mount({ locale = "en", pills = PILLS_EN } = {}) {
   const app = boot({ locale });
   const meter = mountContextMeter(app.document);
-  app.document.getElementById("composer").append(mountStatsLine(app.document, stats), meter.root);
+  app.document.getElementById("composer").append(mountStatsPills(app.document, pills), meter.root);
   app.apply();
   return { app, meter };
 }
@@ -82,12 +82,12 @@ describe("context meter", () => {
 });
 
 describe("mirrored session stats", () => {
-  for (const [name, groups, expected] of [
-    ["English", STATS_EN, [["turns", "2"], ["steps", "5"], ["LLM", "35m38s"], ["Tool call", "20m38s"], ["TTFT avg", "9.9s"], ["tok/s", "97"], ["Cache hit", "99%"], ["Input", "13.6M tok"], ["Output", "0.1M tok"]]],
-    ["Chinese", STATS_ZH, [["轮", "2"], ["步", "5"], ["LLM", "35m38s"], ["工具调用", "20m38s"], ["首 token 平均", "9.9s"], ["tok/s", "97"], ["缓存命中", "99%"], ["输入", "13.6M tok"], ["输出", "0.1M tok"]]],
+  for (const [name, pills, expected] of [
+    ["English", PILLS_EN, [["turns", "2"], ["steps", "5"], ["tok/s", "97"], ["tok", "13.7M"], ["Cache hit", "99%"]]],
+    ["Chinese", PILLS_ZH, [["轮", "2"], ["步", "5"], ["tok/s", "97"], ["tok", "13.7M"], ["缓存命中", "99%"]]],
   ]) {
     it(`splits ${name} stats into a term and a reading, like every other row`, async () => {
-      const { app, meter } = mount({ stats: groups });
+      const { app, meter } = mount({ pills });
       const panel = await openPanel(app, meter);
       const extra = panel.querySelector("[data-oardsh-context-extra]");
       assert.deepEqual(rowsOf(extra), expected);
@@ -99,14 +99,14 @@ describe("mirrored session stats", () => {
     });
   }
 
-  it("leaves the stats in dsh's own line when the preference says so", async () => {
+  it("leaves the stats in dsh's own pills when the preference says so", async () => {
     const app = boot();
     const meter = mountContextMeter(app.document);
-    const strip = mountStatsLine(app.document);
+    const strip = mountStatsPills(app.document);
     app.document.getElementById("composer").append(strip, meter.root);
     app.apply();
     await frame(app.window);
-    assert.ok("oardshStatsHidden" in strip.dataset, "the panel placement hides dsh's line by default");
+    assert.ok("oardshStatsHidden" in strip.dataset, "the panel placement hides dsh's pills by default");
     app.dispose();
   });
 });
