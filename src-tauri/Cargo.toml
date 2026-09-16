@@ -1,6 +1,6 @@
 [package]
 name = "oardsh"
-version = "0.1.2"
+version = "0.1.3"
 description = "Native desktop shell for DeepSeek Harness (dsh web)"
 authors = ["Wang Xin"]
 edition = "2021"
