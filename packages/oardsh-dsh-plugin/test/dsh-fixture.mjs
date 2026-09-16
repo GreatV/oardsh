@@ -1,6 +1,7 @@
 /**
  * dsh's own markup, transcribed from `@deepseek-ai/dsh-client-ui-conversation`
- * (ContextMeter and StatsLine). Transcribed rather than approximated on purpose:
+ * (ContextMeter) and `@deepseek-ai/dsh-client-ui-chat` (StatsPills).
+ * Transcribed rather than approximated on purpose:
  * an invented fixture would keep passing after dsh moves, which is the one
  * outcome worse than no test. `upstream.test.mjs` checks it against the real
  * package.
@@ -30,21 +31,17 @@ export const BUCKETS = [
   { label: "Messages", tokens: "~37.2K", tint: "JObwrW_colorMessages" },
 ];
 
-/// One group per `|`-separated run, exactly as StatsLine joins them.
-export const STATS_EN = [
-  "2 turns · 5 steps",
-  "LLM 35m38s · Tool call 20m38s",
-  "TTFT avg 9.9s · 97 tok/s",
-  "Cache hit 99%",
-  "Input 13.6M tok · Output 0.1M tok",
-];
-export const STATS_ZH = [
-  "2 轮 · 5 步",
-  "LLM 35m38s · 工具调用 20m38s",
-  "首 token 平均 9.9s · 97 tok/s",
-  "缓存命中 99%",
-  "输入 13.6M tok · 输出 0.1M tok",
-];
+/// The two pills StatsPills renders: the time pill with the session's turn,
+/// step and speed readings, then the usage pill with total tokens and cache
+/// hit. Each joins its readings with an aria-hidden middot.
+export const PILLS_EN = {
+  time: ["2 turns 5 steps", "97 tok/s"],
+  usage: ["13.7M tok", "Cache hit 99%"],
+};
+export const PILLS_ZH = {
+  time: ["2 轮 5 步", "97 tok/s"],
+  usage: ["13.7M tok", "缓存命中 99%"],
+};
 
 /**
  * The context meter, wired the way React wires it: the trigger toggles
@@ -100,19 +97,36 @@ export function mountContextMeter(document, { percent = 45, used = "~57.6K", tot
   return { root, trigger, svg: root.querySelector("svg") };
 }
 
-/** dsh's stats line: groups in spans, joined by an aria-hidden `|`. */
-export function mountStatsLine(document, groups = STATS_EN) {
-  const line = document.createElement("div");
-  for (const [index, group] of groups.entries()) {
-    if (index > 0) {
+/**
+ * dsh's session stats: a `data-composer-stats` row of dialog-trigger pills,
+ * each labelled by its readings joined with an aria-hidden middot, the same
+ * join spaced out in the button's aria-label, which is what the plugin reads.
+ */
+export function mountStatsPills(document, pills = PILLS_EN) {
+  const row = document.createElement("div");
+  row.dataset.composerStats = "true";
+  const pill = (readings) => {
+    const anchor = document.createElement("span");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.setAttribute("aria-haspopup", "dialog");
+    button.setAttribute("aria-expanded", "false");
+    button.setAttribute("aria-label", readings.join(" · "));
+    const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    icon.setAttribute("viewBox", "0 0 16 16");
+    icon.setAttribute("aria-hidden", "true");
+    const label = document.createElement("span");
+    label.append(document.createTextNode(readings[0]));
+    for (const reading of readings.slice(1)) {
       const separator = document.createElement("span");
       separator.setAttribute("aria-hidden", "true");
-      separator.textContent = "|";
-      line.append(separator, document.createTextNode(" "));
+      separator.textContent = "·";
+      label.append(separator, document.createTextNode(reading));
     }
-    const span = document.createElement("span");
-    span.textContent = group;
-    line.append(span);
-  }
-  return line;
+    button.append(icon, label);
+    anchor.append(button);
+    return anchor;
+  };
+  for (const readings of [pills.time, pills.usage]) if (readings) row.append(pill(readings));
+  return row;
 }

@@ -137,20 +137,29 @@ window.__ModuleLoader__.load({
     const share = (value, total) => `${Math.round((value / total) * 1000) / 10}%`;
 
     /**
-     * dsh joins its stats into groups ("LLM 35m38s · 工具调用 20m38s") that the
-     * panel has to show as the term/reading pairs every other row uses. Split at
-     * the first digit-leading word; a reading-first stat ("2 轮", "97 tok/s") has
-     * no term, so its trailing unit becomes one.
+     * dsh packs its stats into pill labels ("2 turns 5 steps · 97 tok/s") that
+     * the panel has to show as the term/reading pairs every other row uses. A
+     * term-first stat ("Cache hit 99%") splits at its first digit-leading word.
+     * A reading-first run ("2 turns 5 steps") has no term, so each digit-leading
+     * word opens a reading whose trailing unit words become the term.
      */
     const splitStat = (text) => {
       const words = String(text).trim().split(/\s+/).filter(Boolean);
       const at = words.findIndex((word) => /^[\d.]/.test(word));
-      if (at < 0) return { label: words.join(" "), value: "" };
-      if (at > 0) return { label: words.slice(0, at).join(" "), value: words.slice(at).join(" ") };
-      const unit = words.slice(1).join(" ");
-      return unit ? { label: unit, value: words[0] } : { label: "", value: words[0] };
+      if (at < 0) return [{ label: words.join(" "), value: "" }];
+      if (at > 0) return [{ label: words.slice(0, at).join(" "), value: words.slice(at).join(" ") }];
+      const stats = [];
+      let index = 0;
+      while (index < words.length) {
+        let next = index + 1;
+        while (next < words.length && !/^[\d.]/.test(words[next])) next += 1;
+        const unit = words.slice(index + 1, next).join(" ");
+        stats.push(unit ? { label: unit, value: words[index] } : { label: "", value: words[index] });
+        index = next;
+      }
+      return stats;
     };
-    const statRows = (group) => group.split("·").map((item) => splitStat(item)).filter((row) => row.label || row.value);
+    const statRows = (group) => group.split("·").flatMap((item) => splitStat(item)).filter((row) => row.label || row.value);
 
     /**
      * Where the session stats belong: the context panel (default) or dsh's own
@@ -162,21 +171,27 @@ window.__ModuleLoader__.load({
     const notifyPreferences = () => { for (const listener of preferenceListeners) listener(); };
 
     /**
-     * dsh's stats strip, found by its "|" separator and then remembered: this
-     * runs on DOM mutations, too often to rescan every span each frame.
+     * dsh's stats pills, found by the row's `data-composer-stats` marker and
+     * then remembered: this runs on DOM mutations, too often to rescan the
+     * document each frame.
      */
     let stripCache = null;
     const statsStrip = () => {
       if (stripCache?.isConnected) return stripCache;
       stripCache = null;
-      for (const separator of document.querySelectorAll('span[aria-hidden="true"]')) {
-        if (separator.textContent?.trim() !== "|") continue;
-        const line = separator.parentElement;
-        if (line && statsParts(line).length > 1) { stripCache = line; break; }
-      }
+      const strip = document.querySelector("[data-composer-stats]");
+      if (strip && statsParts(strip).length > 0) stripCache = strip;
       return stripCache;
     };
-    const statsParts = (line) => (line.textContent || "").split("|").map((part) => part.trim()).filter(Boolean);
+    /**
+     * One group per pill, read from its aria-label: the visible label joins its
+     * readings with an aria-hidden middot span and no surrounding spaces, the
+     * aria-label already has them.
+     */
+    const statsParts = (strip) =>
+      [...strip.querySelectorAll('button[aria-haspopup="dialog"]')]
+        .map((pill) => (pill.getAttribute("aria-label") || pill.textContent || "").trim())
+        .filter(Boolean);
     /** Only mirror what we actually hid, so the two can never both be visible. */
     const mirroredStats = () => {
       const strip = statsStrip();
